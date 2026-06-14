@@ -244,6 +244,43 @@ Work down this list; the first one that applies is usually it:
    - Reload the app — the tile clears. If a *second* `No service found …` appears, the app
      pulls more than one service; activate that one the same way. (`/sap/bc/ui5_ui5/…` or
      `/sap/bc/ui2/…` 404s instead ⇒ activate that **ICF node** in `SICF`.)
+8. **A download (e.g. cockpit "Download Template") spins ~30 s then nothing — no file.** The
+   cockpit UI works, the download just dies silently. **It is a TLS/server-certificate
+   problem, not a cockpit/service/timeout problem** — the download is an **HTTPS** request
+   (the ICM HTTPS port `443<inst>`), and the browser is rejecting the SAP server certificate.
+   - **Confirm it's TLS, not a backend error:** `ST22` has **no dump** for it and
+     `/IWFND/ERROR_LOG` shows **no new entry** at the click time (the `/SSB/`
+     `SMART_BUSINESS_RUNTIME_SRV` "Query 2CC… unknown" spam there is unrelated KPI-tile
+     noise). The smoking gun is **`SMICM` → Goto → Trace File**: a
+     `secussl_read_tls13: SSL_read() … "received a fatal TLS certificate unknown alert from
+     the peer"` → `SSLERR_ALERT_CERTIFICATE_UNKNOWN (-127)`, with the server cert shown as
+     `Subject == Issuer` (self-signed) and **`SANs: <none>`**.
+   - **Why:** the delivered SSL server PSE (`SAPSSLS.pse`, STRUST node **SSL server
+     Standard**) is **self-signed and has no Subject Alternative Name** — modern
+     Chrome/Brave/Firefox reject CN-only certs outright. **Crucial gotcha:** a browser
+     click-through ("Proceed anyway") only covers **top-level navigations**, *never*
+     background **XHR/fetch** requests — and a download is an XHR. So visiting the HTTPS URL
+     and accepting the cert does **not** fix it (and STRUST's **Subject (Alt.)** field is
+     **display-only** — you can't add a SAN in the GUI here).
+   - **Quick unblock (dev box):** launch the browser ignoring cert errors — e.g. macOS
+     `open -na "Google Chrome" --args --ignore-certificate-errors --user-data-dir=/tmp/insec`.
+     This disables validation for XHR too, so the download goes through.
+   - **Proper fix:** give the ICM a **trusted** cert **with a SAN**. Two ways:
+     - *Self-signed + SAN:* regenerate `SAPSSLS.pse` on the OS as `<sid>adm` —
+       `sapgenpse gen_pse -p $SECUDIR/SAPSSLS.pse -x "" -s "<fqdn>" "CN=<fqdn>"` (verify the
+       SAN flag via `sapgenpse gen_pse -h`), `seclogin -O <sid>adm`, restart ICM — **then
+       still import that cert into every client's trust store** (self-signed = untrusted).
+     - *CA-signed (best — no per-client trust step):* get a public cert (e.g. **Let's
+       Encrypt via DNS-01**, which needs no inbound access) for a hostname **under a domain
+       you control** (`s4hana2025.<your-domain>`); bundle key+cert to PKCS#12
+       (`openssl pkcs12 -export …`); import into `SAPSSLS.pse` (STRUST **SSL server Standard
+       → PSE → Import**, or `sapgenpse import_p12`); `seclogin`; restart ICM. Set
+       **`icm/host_name_full = <fqdn>`** (`RZ10`, restart ICM) and point **DNS** (an A record,
+       e.g. to the box's overlay/VPN IP) at it — no `/etc/hosts` needed. The cert validates
+       the **name**, not the IP, so a private/overlay IP is fine; a public CA means browsers
+       trust it automatically and the XHR download just works.
+   - Related: a download URL is built from `icm/host_name_full` (item 6) — keep the FQDN in
+     the cert SAN, `icm/host_name_full`, DNS, and the browser URL **all identical**.
 
 ### 4.2 In-app workflow
 
