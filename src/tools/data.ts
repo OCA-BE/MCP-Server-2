@@ -46,7 +46,11 @@ export async function handleExecuteDataQuery(args: {
 }) {
   validateSql(args.sql)
   const client = await ensureConnected(args.connectionId)
-  const result = await client.runQuery(args.sql, args.maxRows ?? 100)
+  // Stateless clone: ADT Data Preview generates a subroutine pool per query and
+  // ABAP caps those at 36 per internal session.  Running on the long-lived
+  // stateful session would accumulate them until a CX_SY_GENERATE_SUBPOOL_FULL
+  // dump (CL_ADT_DP_OPEN_SQL_HANDLER); stateless rolls out each request's pool.
+  const result = await client.statelessClone.runQuery(args.sql, args.maxRows ?? 100)
   return { content: [{ type: "text" as const, text: formatQueryResult(result) }] }
 }
 
@@ -60,7 +64,9 @@ export async function handleReadTableContents(args: {
     return { content: [{ type: "text" as const, text: `Invalid table name: ${args.tableName}` }] }
   }
   const client = await ensureConnected(args.connectionId)
-  const result = await client.tableContents(args.tableName, args.maxRows ?? 100, false, args.whereClause)
+  // Stateless clone for the same reason as execute_data_query — keep read-only
+  // table previews out of the long-lived stateful session (no subpool buildup).
+  const result = await client.statelessClone.tableContents(args.tableName, args.maxRows ?? 100, false, args.whereClause)
   return { content: [{ type: "text" as const, text: formatQueryResult(result) }] }
 }
 

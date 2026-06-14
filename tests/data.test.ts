@@ -10,7 +10,10 @@ import type { QueryResult } from "abap-adt-api"
 vi.mock("../src/connections", () => ({ ensureConnected: vi.fn(), getHeldLock: vi.fn(), trackLock: vi.fn(), forgetLock: vi.fn() }))
 import { ensureConnected } from "../src/connections"
 
-const mockClient = { runQuery: vi.fn(), tableContents: vi.fn() }
+// statelessClone points back at the mock so the read handlers (which run on the
+// stateless clone to avoid ADT subpool buildup) hit the same spies.
+const mockClient: any = { runQuery: vi.fn(), tableContents: vi.fn() }
+mockClient.statelessClone = mockClient
 
 beforeEach(() => {
   vi.clearAllMocks()

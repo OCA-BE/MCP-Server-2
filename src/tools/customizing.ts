@@ -32,7 +32,13 @@ export async function runSql(client: ADTClient, sql: string, maxRows = 200): Pro
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const c = attempt === 0 ? client : await forceReconnect()
-      return await c.runQuery(sql, maxRows)
+      // Run freestyle SQL on the STATELESS clone, not the long-lived stateful
+      // session.  ADT's Data Preview (CL_ADT_DP_OPEN_SQL_HANDLER) does a
+      // GENERATE SUBROUTINE POOL per query; ABAP caps those at 36 per internal
+      // session.  In the stateful session they accumulate until the 37th query
+      // dumps with CX_SY_GENERATE_SUBPOOL_FULL.  Stateless = fresh roll area per
+      // request → the subpools are rolled out each call and never pile up.
+      return await c.statelessClone.runQuery(sql, maxRows)
     } catch (err) {
       lastErr = err
       if (attempt < 2) { log("DEBUG", `runSql retry ${attempt + 1} after error`, err); await sleep(200) }
@@ -568,7 +574,7 @@ export async function handleCustomizingRead(args: {
     // Fall back to runQuery if tableContents WITH whereClause fails (SICF not active)
     if (whereClause) {
       const sql = `SELECT * FROM ${baseTable} WHERE ${whereClause}`
-      result = await client.runQuery(sql, max) as any
+      result = await client.statelessClone.runQuery(sql, max) as any
     } else {
       throw err
     }
@@ -605,8 +611,8 @@ export async function handleCustomizingDiff(args: {
   const tgtSql = `SELECT * FROM ${baseTable} WHERE ${kf} = '${tgt}'`
 
   const [srcResult, tgtResult] = await Promise.all([
-    client.runQuery(srcSql, 500),
-    client.runQuery(tgtSql, 500),
+    client.statelessClone.runQuery(srcSql, 500),
+    client.statelessClone.runQuery(tgtSql, 500),
   ])
 
   const srcRows = tableRows(srcResult)
@@ -690,8 +696,8 @@ export async function handleCustomizingPlanChange(args: {
   const srcSql = `SELECT * FROM ${baseTable} WHERE ${kf} = '${src}'`
   const tgtSql = `SELECT * FROM ${baseTable} WHERE ${kf} = '${tgt}'`
   const [srcResult, tgtResult] = await Promise.all([
-    client.runQuery(srcSql, 500),
-    client.runQuery(tgtSql, 500),
+    client.statelessClone.runQuery(srcSql, 500),
+    client.statelessClone.runQuery(tgtSql, 500),
   ])
 
   const srcRows = tableRows(srcResult)
