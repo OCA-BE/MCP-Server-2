@@ -1,0 +1,25 @@
+{
+  "connections": [
+    {
+      "id": "DEV",
+      "url": "https://your-sap-system:44301",
+      "username": "DEVELOPER",
+      "password": "your-password",
+      "client": "100",
+      "language": "EN",
+      "allowSelfSigned": true
+    },
+    {
+      "id": "QAS",
+      "url": "http://your-qas-system:8001",
+      "username": "DEVELOPER",
+      "password": "your-password",
+      "client": "200",
+      "language": "EN"
+    }
+  ],
+  "server": {
+    "port": 4847,
+    "apiKey": "change-this-to-a-random-secret"
+  }
+}

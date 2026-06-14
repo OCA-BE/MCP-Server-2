@@ -1,0 +1,13 @@
+Site,SiteName,SiteCategory,SiteCategoryText,SiteProfile,CompanyCode,PurchasingOrg,SalesOrg,DistributionChannel,Division,Country,City,PostalCode,Street,BusinessPartnerGrouping
+GHDC,Ghent Distribution Center,B,Distribution center,ZDC,Z100,Z100,BE01,10,00,BE,Ghent,9000,Havenlaan 1,S100
+ANDC,Antwerp Distribution Center,B,Distribution center,ZDC,Z100,Z100,BE01,10,00,BE,Antwerp,2000,Scheldekaai 5,S100
+GHST,Ghent Store,A,Retail store,ZSTO,Z100,Z100,BE01,10,00,BE,Ghent,9000,Veldstraat 10,S110
+ANST,Antwerp Store,A,Retail store,ZSTO,Z100,Z100,BE01,10,00,BE,Antwerp,2000,Meir 50,S110
+CTDC,Cape Town Distribution Center,B,Distribution center,ZDC,Z200,Z100,ZA01,10,00,ZA,Cape Town,8000,Dock Road 3,S100
+JBDC,Johannesburg Distribution Center,B,Distribution center,ZDC,Z200,Z100,ZA01,10,00,ZA,Johannesburg,2000,Main Reef Road 12,S100
+CTST,Cape Town Store,A,Retail store,ZSTO,Z200,Z100,ZA01,10,00,ZA,Cape Town,8000,Long Street 88,S110
+JBST,Johannesburg Store,A,Retail store,ZSTO,Z200,Z100,ZA01,10,00,ZA,Johannesburg,2000,Commissioner Street 200,S110
+MSDC,Maseru Distribution Center,B,Distribution center,ZDC,Z300,Z100,LS01,10,00,LS,Maseru,100,Industrial Road 1,S100
+TYDC,Teyateyaneng Distribution Center,B,Distribution center,ZDC,Z300,Z100,LS01,10,00,LS,Teyateyaneng,200,Main Road 4,S100
+MSST,Maseru Store,A,Retail store,ZSTO,Z300,Z100,LS01,10,00,LS,Maseru,100,Kingsway 15,S110
+TYST,Teyateyaneng Store,A,Retail store,ZSTO,Z300,Z100,LS01,10,00,LS,Teyateyaneng,200,Market Street 7,S110

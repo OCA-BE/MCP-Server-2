@@ -1,0 +1,72 @@
+import * as fs from "fs"
+import * as path from "path"
+import * as os from "os"
+
+export interface ConnectionConfig {
+  id: string
+  url: string
+  username: string
+  password: string
+  client?: string
+  language?: string
+  /** Accept self-signed / untrusted TLS certificates (common on SAP dev systems). */
+  allowSelfSigned?: boolean
+  /** Optional PEM CA certificate (string) to trust for HTTPS connections. */
+  ca?: string
+  /** Request timeout in milliseconds (default: library default). */
+  timeout?: number
+}
+
+export interface ServerConfig {
+  port?: number
+  apiKey?: string
+}
+
+export interface Config {
+  connections: ConnectionConfig[]
+  server?: ServerConfig
+}
+
+function resolveConfigPath(): string {
+  if (process.env.ABAP_MCP_CONFIG) return process.env.ABAP_MCP_CONFIG
+
+  const candidates = [
+    path.join(process.cwd(), "connections.json"),
+    path.join(os.homedir(), ".abap-mcp", "connections.json"),
+    path.join(os.homedir(), ".config", "abap-mcp", "connections.json"),
+  ]
+
+  for (const p of candidates) {
+    if (fs.existsSync(p)) return p
+  }
+
+  return candidates[0]
+}
+
+let _config: Config | null = null
+
+export function loadConfig(): Config {
+  if (_config) return _config
+
+  const configPath = resolveConfigPath()
+
+  if (!fs.existsSync(configPath)) {
+    console.error(`No config file found. Create one at: ${configPath}`)
+    console.error(`See connections.example.json for the format.`)
+    process.exit(1)
+  }
+
+  const raw = fs.readFileSync(configPath, "utf-8")
+  _config = JSON.parse(raw) as Config
+
+  if (!_config.connections || _config.connections.length === 0) {
+    console.error("No connections defined in config file.")
+    process.exit(1)
+  }
+
+  return _config
+}
+
+export function getServerConfig(): ServerConfig {
+  return loadConfig().server ?? {}
+}

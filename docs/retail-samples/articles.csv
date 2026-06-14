@@ -1,0 +1,6 @@
+Material,ArticleType,MerchandiseCategory,MerchandiseCategoryName,BaseUnit,Division,DescriptionEN,GTIN_EAN,GTINCategory,TaxDepartureCountry,TaxType,TaxClassification
+10000001,FOOD,0101,Dairy,EA,01,Milk,4000000010016,HE,BE,MWST,1
+10000002,FOOD,0102,Bakery,EA,01,Bread,4000000010023,HE,BE,MWST,1
+10000003,HAWA,0201,Electronics,EA,02,Television,4000000010030,HE,BE,MWST,1
+10000004,HAWA,0202,Clothing,EA,02,Shirt,4000000010047,HE,BE,MWST,1
+10000005,FOOD,0103,Beverages,EA,01,Coffee,4000000010054,HE,BE,MWST,1

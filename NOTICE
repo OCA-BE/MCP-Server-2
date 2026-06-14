@@ -1,0 +1,42 @@
+abap-config-mcp
+Copyright (c) 2026 Geert Steyaert
+Licensed under the MIT License (see LICENSE).
+
+This product is an independent, from-scratch work. Its MCP server, its ABAP
+development tools, and its in-system customizing engine were written for this
+project and do not incorporate source code from any other project.
+
+--------------------------------------------------------------------------------
+Inspiration
+--------------------------------------------------------------------------------
+
+The concept of driving the SAP ABAP Development Tools (ADT) protocol from
+outside the SAP GUI was inspired by Marcello Urbani's project:
+
+    vscode_abap_remote_fs
+    https://github.com/marcellourbani/vscode_abap_remote_fs
+    (MIT License)
+
+No code from vscode_abap_remote_fs is used in this project.
+
+--------------------------------------------------------------------------------
+Third-party dependencies
+--------------------------------------------------------------------------------
+
+This project depends on the following libraries at runtime, used under their
+respective licenses:
+
+  abap-adt-api  -  https://github.com/marcellourbani/abap-adt-api
+                   Copyright (c) Marcello Urbani
+                   MIT License
+                   Provides the low-level ADT (ABAP Development Tools) REST
+                   protocol client that this server builds upon.
+
+  @modelcontextprotocol/sdk  -  https://github.com/modelcontextprotocol
+                   MIT License
+
+  zod  -  https://github.com/colinhacks/zod
+                   MIT License
+
+Full dependency license texts are available under node_modules/<package>/ after
+installation.

@@ -1,0 +1,121 @@
+import { describe, it, expect, vi, beforeEach } from "vitest"
+import {
+  validateSql,
+  formatQueryResult,
+  handleExecuteDataQuery,
+  handleReadTableContents,
+} from "../src/tools/data"
+import type { QueryResult } from "abap-adt-api"
+
+vi.mock("../src/connections", () => ({ ensureConnected: vi.fn(), getHeldLock: vi.fn(), trackLock: vi.fn(), forgetLock: vi.fn() }))
+import { ensureConnected } from "../src/connections"
+
+const mockClient = { runQuery: vi.fn(), tableContents: vi.fn() }
+
+beforeEach(() => {
+  vi.clearAllMocks()
+  vi.mocked(ensureConnected).mockResolvedValue(mockClient as any)
+})
+
+// ─── validateSql ──────────────────────────────────────────────────────────────
+
+describe("validateSql", () => {
+  it("accepts SELECT statements", () => {
+    expect(() => validateSql("SELECT * FROM MARA")).not.toThrow()
+    expect(() => validateSql("  select matnr from mara")).not.toThrow()
+  })
+
+  it("blocks DML statements", () => {
+    expect(() => validateSql("INSERT INTO MARA VALUES (1)")).toThrow("blocked")
+    expect(() => validateSql("UPDATE MARA SET MATNR = 'X'")).toThrow("blocked")
+    expect(() => validateSql("DELETE FROM MARA")).toThrow("blocked")
+    expect(() => validateSql("DROP TABLE MARA")).toThrow("blocked")
+    expect(() => validateSql("ALTER TABLE MARA ADD COL")).toThrow("blocked")
+    expect(() => validateSql("TRUNCATE MARA")).toThrow("blocked")
+  })
+
+  it("blocks non-SELECT statements", () => {
+    expect(() => validateSql("EXEC sp_foo")).toThrow()  // caught by DML pattern
+    expect(() => validateSql("MARA")).toThrow("must start with SELECT")
+    expect(() => validateSql("SHOW TABLES")).toThrow("must start with SELECT")
+  })
+})
+
+// ─── formatQueryResult ────────────────────────────────────────────────────────
+
+describe("formatQueryResult", () => {
+  it("renders header, separator, and rows", () => {
+    const result: QueryResult = {
+      columns: [{ name: "MATNR" }, { name: "MAKTX" }],
+      values: [{ MATNR: "100-100", MAKTX: "Screw" }]
+    } as any
+    const text = formatQueryResult(result)
+    expect(text).toContain("MATNR")
+    expect(text).toContain("MAKTX")
+    expect(text).toContain("100-100")
+    expect(text).toContain("Screw")
+    expect(text).toContain("(1 row(s))")
+  })
+
+  it("handles empty result set", () => {
+    const result: QueryResult = {
+      columns: [{ name: "MATNR" }],
+      values: []
+    } as any
+    const text = formatQueryResult(result)
+    expect(text).toContain("(0 row(s))")
+  })
+
+  it("returns error message when no columns", () => {
+    const result: QueryResult = { columns: [], values: [] } as any
+    expect(formatQueryResult(result)).toContain("No columns")
+  })
+})
+
+// ─── execute_data_query ───────────────────────────────────────────────────────
+
+describe("execute_data_query", () => {
+  it("executes a valid SELECT and formats result", async () => {
+    mockClient.runQuery.mockResolvedValue({
+      columns: [{ name: "MATNR" }],
+      values: [{ MATNR: "Z001" }]
+    })
+    const result = await handleExecuteDataQuery({ sql: "SELECT MATNR FROM MARA" })
+    expect(mockClient.runQuery).toHaveBeenCalledWith("SELECT MATNR FROM MARA", 100)
+    expect(result.content[0].text).toContain("Z001")
+  })
+
+  it("rejects DML without calling the SAP system", async () => {
+    await expect(handleExecuteDataQuery({ sql: "DELETE FROM MARA" })).rejects.toThrow("blocked")
+    expect(mockClient.runQuery).not.toHaveBeenCalled()
+  })
+
+  it("passes custom maxRows", async () => {
+    mockClient.runQuery.mockResolvedValue({ columns: [{ name: "A" }], values: [] })
+    await handleExecuteDataQuery({ sql: "SELECT A FROM T", maxRows: 5 })
+    expect(mockClient.runQuery).toHaveBeenCalledWith(expect.any(String), 5)
+  })
+})
+
+// ─── read_table_contents ──────────────────────────────────────────────────────
+
+describe("read_table_contents", () => {
+  it("reads a valid table name", async () => {
+    mockClient.tableContents.mockResolvedValue({ columns: [{ name: "MATNR" }], values: [{ MATNR: "X" }] })
+    const result = await handleReadTableContents({ tableName: "MARA" })
+    expect(mockClient.tableContents).toHaveBeenCalledWith("MARA", 100, false, undefined)
+    expect(result.content[0].text).toContain("X")
+  })
+
+  it("rejects invalid table names without calling SAP", async () => {
+    const result = await handleReadTableContents({ tableName: "MARA; DROP TABLE MARA" })
+    expect(result.content[0].text).toContain("Invalid table name")
+    expect(mockClient.tableContents).not.toHaveBeenCalled()
+  })
+
+  it("passes whereClause through", async () => {
+    mockClient.tableContents.mockResolvedValue({ columns: [{ name: "MATNR" }], values: [] })
+    await handleReadTableContents({ tableName: "MARA", whereClause: "MATNR LIKE 'Z%'" })
+    expect(mockClient.tableContents).toHaveBeenCalledWith("MARA", 100, false, "MATNR LIKE 'Z%'")
+  })
+})

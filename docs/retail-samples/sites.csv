@@ -1,0 +1,3 @@
+Site,SiteName,SiteCategory,SiteCategoryText,SiteProfile,CompanyCode,PurchasingOrg,SalesOrg,DistributionChannel,Division,Country,City,PostalCode,Street,BusinessPartnerGrouping
+GHST,Ghent Store,A,Retail store,ZSTO,Z100,Z100,BE01,10,00,BE,Ghent,9000,Veldstraat 10,S110
+GHDC,Ghent Distribution Center,B,Distribution center,ZDC,Z100,Z100,BE01,10,00,BE,Ghent,9000,Havenlaan 1,S100
