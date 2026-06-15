@@ -216,7 +216,7 @@ Work down this list; the first one that applies is usually it:
    Fiori) with the host from profile parameter **`icm/host_name_full`** (here
    `s4hana2025.sapdemo.com`), **not** the short name you may have in your hosts file — so the
    browser fails to reach the box. Fix on the **client** (preferred — FQDNs keep SSO/cookies
-   happy): add the FQDN beside the short name, e.g. `172.26.131.71 s4hana2025.sapdemo.com
+   happy): add the FQDN beside the short name, e.g. `<box-ip> s4hana2025.sapdemo.com
    s4hana2025` (macOS/Linux `/etc/hosts`, needs `sudo`; flush with `sudo dscacheutil
    -flushcache; sudo killall -HUP mDNSResponder`). Or make **SAP** emit the short name: `RZ10`
    → instance profile → `icm/host_name_full = s4hana2025` → restart the ICM (not a dynamic
