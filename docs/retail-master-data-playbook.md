@@ -352,6 +352,50 @@ first as in §2a). For a one-off field-selection relax (to let the BAPI route wo
 articles), OMS9 → *Maintain Field Selection for Data Screens* → field → **Required entry →
 Optional entry** (input-validation only; zero runtime impact; reversible).
 
+### 4.3 ✅ Worked recipe — Articles via the **Product** object (staging), verified end-to-end
+
+Loaded the 5 sample articles on A4H/250 (S/4HANA 2025). The exact flow + every wall hit:
+
+**Setup**
+1. New migration project → **Staging Tables** (on 2025 "Files" project type is gone), dev
+   class **`$TMP`**, add the **Product** migration object. On "predecessor objects"
+   (Merchandise category / Profit center / Supplier / Production supply area) **uncheck all**
+   — those already exist; you only reference them.
+2. Active View = **Standard Scope** (must be *saved/confirmed* — §4.1 item 5).
+3. **Mapping Tasks → confirm the 3 control parameters.** Set **"Product, Internal or
+   External Numbering" = `Internal`** — the IS-Retail norm; SAP assigns the article numbers.
+   *Don't* force external numeric numbers like `10000001` — they fail `M3 565` "ext.
+   material no. must not contain only numbers" (FOOD) / `M3 318` "not defined for material
+   type" (HAWA), because purely-numeric numbers belong to the internal range. Keep your
+   numbers in `PRODUCT` only as the **source correlation key**; SAP maps source→assigned.
+
+**Fill the template (Download Template → CSV; fill only these sheets, rest stay empty):**
+| Sheet | Fields | Notes |
+|---|---|---|
+| **`S_MARA`** (`#FreeText_Mandatory`) | `PRODUCT`, `MTART`, **`MBRSH=1`**, `MATKL`, `MAKTX`, `SPRAS`, `MEINS`, `SPART`, **`EAN11`**, **`NUMTP`** | `MBRSH=1` (=Retail) is **mandatory** (`M3 099` "Enter an industry sector" if blank). The **main GTIN goes here in `EAN11`+`NUMTP`** (category, e.g. `HE`). |
+| **`S_MLAN`** (tax) | `ALAND`, `TATYP1`, `TAXM1` | e.g. `BE` / `MWST` / `1`. |
+| **`S_MEAN`** | *(leave empty)* | The base-unit main EAN lives in `MARA-EAN11`, **not** here — S_MEAN has no main-flag column, so putting the EAN here triggers "**First specify the main EAN for the unit**". |
+
+**Format gotchas that cost the most time**
+- **CRLF line endings are mandatory.** The downloaded template is a single header line with
+  **no terminator**; if you save data rows with plain `\n` the cockpit parser merges
+  header+data → "**Field "<value>" does not exist in S_MARA**" and the file shows
+  "**Not Mapped to Any Data Structure**". Write `\r\n`.
+- **EAN-13 needs a valid GS1 check digit** or "**The EAN … has an incorrect check digit**".
+  (Recompute the 13th digit; don't trust hand-typed GTINs.)
+
+**Run:** Upload File — **allow browser popups for the host** (the download/upload uses a
+window that's popup-blocked by default → "spinner, nothing happens", see §4.1 item 8) →
+**Transfer Data to Staging Tables → Prepare → Simulate** (fix field errors, re-upload the
+*whole* ZIP so cleared sheets like S_MEAN actually empty in staging) → **Migrate**.
+Monitoring shows the SAP-assigned article number per source key.
+
+**The error ladder we climbed** (each fixed in the CSV/task, re-Simulate between):
+`M3 099` industry sector → set `MBRSH=1`; `M3 565`/`M3 318` number range → switch to
+**Internal**; EAN "incorrect check digit" → valid GS1 digit; "main EAN for unit" → move GTIN
+to `MARA-EAN11`+`NUMTP`, empty `S_MEAN` → **green → Migrate**. Sample data:
+[`docs/retail-samples/articles.csv`](retail-samples/articles.csv).
+
 ---
 
 ## 5. Cross-cutting gotchas (save yourself the round-trips)
