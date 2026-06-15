@@ -33,6 +33,7 @@ CLASS zcl_mcp_cust_engine DEFINITION
              action           TYPE string,     " write/delete: '' / 'INS' = upsert ; 'DEL' = delete via the view ; org_copy: 'COPY' / 'DELE'
              org_unit         TYPE string,     " org_copy: org-key DOMAIN (BUKRS, WERKS, VKORG, VTWEG, SPART, EKORG, …)
              values_json      TYPE string,     " write: JSON array of {FIELD,VALUE} overrides applied to every planned row
+             rows_json        TYPE string,     " create: JSON array of rows, each row a JSON array of {FIELD,VALUE} (full key + data)
            END OF ty_request.
 
     " Field override for handle_write: applied to each planned row after the
@@ -118,6 +119,31 @@ CLASS zcl_mcp_cust_engine DEFINITION
     METHODS handle_write
       IMPORTING is_req         TYPE ty_request
       RETURNING VALUE(rs_resp) TYPE ty_response.
+
+    "! Create rows from explicit field/value maps (full key, no source row) and
+    "! write them through the same recorded view-runtime path as handle_write.
+    "! Unlike handle_write (a single-key copy), this supports composite keys and
+    "! distinct per-row values — e.g. storage locations (WERKS+LGORT+LGOBE).
+    METHODS handle_create
+      IMPORTING is_req         TYPE ty_request
+      RETURNING VALUE(rs_resp) TYPE ty_response.
+
+    "! Shared commit machinery for a built plan: delivery-class routing, client
+    "! capability + S_TABU_DIS check, transport resolution, then the recorded
+    "! batch-job write (view runtime) or direct MODIFY. Used by both the copy
+    "! (handle_write) and the explicit-row (handle_create) plan builders.
+    METHODS commit_plan
+      IMPORTING is_req  TYPE ty_request
+                ir_plan TYPE REF TO data
+      CHANGING  cs_resp TYPE ty_response.
+
+    "! True if a row with the given key already exists in the table (key fields
+    "! read from DD03L; CLNT forced to sy-mandt). Used by handle_create's
+    "! ONLY_MISSING to skip rows that are already present.
+    METHODS row_exists
+      IMPORTING iv_table     TYPE string
+                ir_row       TYPE REF TO data
+      RETURNING VALUE(rv_ok) TYPE abap_bool.
 
     METHODS handle_delete
       IMPORTING is_req         TYPE ty_request
@@ -296,6 +322,7 @@ CLASS zcl_mcp_cust_engine IMPLEMENTATION.
             WHEN 'ping'.     ls_resp = handle_ping( ).
             WHEN 'read'.     ls_resp = handle_read( ls_req ).
             WHEN 'write'.    ls_resp = handle_write( ls_req ).
+            WHEN 'create'.   ls_resp = handle_create( ls_req ).
             WHEN 'delete'.   ls_resp = handle_delete( ls_req ).
             WHEN 'selftest'. ls_resp = handle_selftest( ls_req ).
             WHEN 'status'.   ls_resp = handle_status( ls_req ).
@@ -682,11 +709,7 @@ CLASS zcl_mcp_cust_engine IMPLEMENTATION.
           lr_one      TYPE REF TO data,
           lv_where    TYPE string,
           lv_flag     TYPE dd02l-contflag,
-          lv_grp      TYPE tddat-cclass,
-          lv_enq      TYPE rstable-tabname,
-          lv_ok       TYPE abap_bool,
           lv_nk       TYPE trobj_name,
-          lt_keys     TYPE ty_tabkey_tt,
           lt_tgt_keys TYPE ty_tabkey_tt.
     FIELD-SYMBOLS: <src>  TYPE STANDARD TABLE,
                    <tgt>  TYPE STANDARD TABLE,
@@ -717,98 +740,10 @@ CLASS zcl_mcp_cust_engine IMPLEMENTATION.
       RETURN.
     ENDIF.
 
+    " Delivery class is needed only for the dry-run wording here; the full
+    " routing/auth/transport logic now lives in commit_plan (shared with
+    " handle_create) and runs at commit time.
     lv_flag = delivery_class( is_req-table ).
-    CASE lv_flag.
-      WHEN 'C' OR 'G' OR 'E'.
-        " Customizing / control: transport-recorded (via batch job) or direct
-        " (record_transport = false).  RECORD_TRANSPORT defaults to true.
-        DATA(lv_do_record) = COND abap_bool(
-          WHEN is_req-record_transport = abap_false THEN abap_false ELSE abap_true ).
-
-        " Client capability (T000/SCC4): a client set to "changes without
-        " automatic recording" writes data but records nothing; a "no changes"
-        " client forbids it outright.  Route per the client setting instead of
-        " assuming every C/G/E change records — otherwise the post-commit E071K
-        " check has nothing to find and the result misreports a transport fault.
-        DATA lv_cl_norecord TYPE abap_bool.
-        eval_client_change(
-          EXPORTING iv_table   = is_req-table
-          IMPORTING ev_blocked = DATA(lv_cl_blocked)
-                    ev_records = DATA(lv_cl_records)
-                    ev_reason  = DATA(lv_cl_reason) ).
-        IF lv_cl_blocked = abap_true.
-          rs_resp-status = 'error'.
-          APPEND lv_cl_reason TO rs_resp-messages.
-          RETURN.
-        ENDIF.
-        IF lv_do_record = abap_true AND lv_cl_records = abap_false.
-          " Customizing change in a non-recording client: still goes through the
-          " SM30 view runtime, but without a transport.  Reject a supplied one.
-          IF is_req-transport IS NOT INITIAL.
-            rs_resp-status = 'error'.
-            APPEND |{ lv_cl_reason } — omit TRANSPORT| TO rs_resp-messages.
-            RETURN.
-          ENDIF.
-          lv_cl_norecord = abap_true.
-          APPEND lv_cl_reason TO rs_resp-messages.
-        ENDIF.
-
-        " No transport supplied for a recorded commit: mint a new Customizing
-        " request ONLY when explicitly asked (create_transport=X). Otherwise the
-        " caller is expected to pass an existing open request — the governed
-        " default (transports are pre-provisioned, not created per write).
-        DATA(lv_autocreate) = COND abap_bool(
-          WHEN lv_do_record = abap_true AND lv_cl_norecord = abap_false
-                                        AND is_req-commit = abap_true
-                                        AND is_req-transport IS INITIAL
-                                        AND is_req-create_transport = abap_true
-          THEN abap_true ELSE abap_false ).
-        IF lv_do_record = abap_true AND lv_cl_norecord = abap_false
-                                    AND is_req-commit = abap_true
-                                    AND is_req-transport IS INITIAL
-                                    AND is_req-create_transport = abap_false.
-          rs_resp-status = 'error'.
-          APPEND 'No TRANSPORT supplied. Record into an existing open request (preferred), or set CREATE_TRANSPORT=X to mint a new Customizing request.'
-            TO rs_resp-messages.
-          RETURN.
-        ENDIF.
-        IF lv_do_record = abap_false AND is_req-transport IS NOT INITIAL.
-          rs_resp-status = 'error'.
-          APPEND 'TRANSPORT must be omitted when RECORD_TRANSPORT=false (direct-write mode)'
-            TO rs_resp-messages.
-          RETURN.
-        ENDIF.
-      WHEN 'A'.
-        " Application data — direct write, no transport recording
-        IF is_req-transport IS NOT INITIAL.
-          rs_resp-status = 'error'.
-          APPEND |{ is_req-table } is delivery class A: TRANSPORT not applicable — omit it|
-            TO rs_resp-messages.
-          RETURN.
-        ENDIF.
-        lv_do_record = abap_false.
-      WHEN 'S' OR 'W' OR 'L'.
-        rs_resp-status = 'error'.
-        APPEND |Delivery class '{ lv_flag }': system/temp/local tables are not supported|
-          TO rs_resp-messages.
-        RETURN.
-      WHEN OTHERS.
-        rs_resp-status = 'error'.
-        APPEND |Delivery class '{ lv_flag }': C/G/E/A supported; S/W/L refused|
-          TO rs_resp-messages.
-        RETURN.
-    ENDCASE.
-
-    lv_grp = auth_group( is_req-table ).
-    AUTHORITY-CHECK OBJECT 'S_TABU_DIS'
-      ID 'DICBERCLS' FIELD lv_grp
-      ID 'ACTVT'     FIELD '02'.
-    IF sy-subrc <> 0.
-      rs_resp-status = 'error'.
-      APPEND |Not authorized: S_TABU_DIS / { lv_grp } / 02|
-        TO rs_resp-messages.
-      RETURN.
-    ENDIF.
 
     " ── Read source + target ────────────────────────────────────────────────
     TRY.
@@ -944,6 +879,109 @@ CLASS zcl_mcp_cust_engine IMPLEMENTATION.
       RETURN.
     ENDIF.
 
+    " Shared commit machinery (routing, auth, transport resolution, recorded
+    " batch-job write or direct MODIFY). Same path used by handle_create.
+    commit_plan( EXPORTING is_req  = is_req
+                           ir_plan = lr_plan
+                 CHANGING  cs_resp = rs_resp ).
+  ENDMETHOD.
+
+
+  METHOD commit_plan.
+    " Writes the already-built plan in IR_PLAN (a table typed as IS_REQ-TABLE)
+    " through the recorded view runtime (C/G/E in a recording client) or a direct
+    " MODIFY (class A, a non-recording client, or RECORD_TRANSPORT=false). Sets
+    " CS_RESP status/rows_written/transport and appends messages. Assumes the
+    " caller already handled dry-run and the empty-plan case.
+    DATA: lr_one TYPE REF TO data,
+          lv_grp TYPE tddat-cclass,
+          lv_enq TYPE rstable-tabname,
+          lv_flag TYPE dd02l-contflag,
+          lt_keys TYPE ty_tabkey_tt.
+    FIELD-SYMBOLS: <plan> TYPE STANDARD TABLE,
+                   <row>  TYPE any,
+                   <one>  TYPE any.
+
+    ASSIGN ir_plan->* TO <plan>.
+
+    " ── Delivery-class routing + client capability ───────────────────────────
+    lv_flag = delivery_class( is_req-table ).
+    DATA lv_do_record TYPE abap_bool.
+    DATA lv_cl_norecord TYPE abap_bool.
+    DATA lv_autocreate TYPE abap_bool.
+    CASE lv_flag.
+      WHEN 'C' OR 'G' OR 'E'.
+        lv_do_record = COND abap_bool(
+          WHEN is_req-record_transport = abap_false THEN abap_false ELSE abap_true ).
+        eval_client_change(
+          EXPORTING iv_table   = is_req-table
+          IMPORTING ev_blocked = DATA(lv_cl_blocked)
+                    ev_records = DATA(lv_cl_records)
+                    ev_reason  = DATA(lv_cl_reason) ).
+        IF lv_cl_blocked = abap_true.
+          cs_resp-status = 'error'.
+          APPEND lv_cl_reason TO cs_resp-messages.
+          RETURN.
+        ENDIF.
+        IF lv_do_record = abap_true AND lv_cl_records = abap_false.
+          IF is_req-transport IS NOT INITIAL.
+            cs_resp-status = 'error'.
+            APPEND |{ lv_cl_reason } — omit TRANSPORT| TO cs_resp-messages.
+            RETURN.
+          ENDIF.
+          lv_cl_norecord = abap_true.
+          APPEND lv_cl_reason TO cs_resp-messages.
+        ENDIF.
+        lv_autocreate = COND abap_bool(
+          WHEN lv_do_record = abap_true AND lv_cl_norecord = abap_false
+                                        AND is_req-transport IS INITIAL
+                                        AND is_req-create_transport = abap_true
+          THEN abap_true ELSE abap_false ).
+        IF lv_do_record = abap_true AND lv_cl_norecord = abap_false
+                                    AND is_req-transport IS INITIAL
+                                    AND is_req-create_transport = abap_false.
+          cs_resp-status = 'error'.
+          APPEND 'No TRANSPORT supplied. Record into an existing open request (preferred), or set CREATE_TRANSPORT=X to mint a new Customizing request.'
+            TO cs_resp-messages.
+          RETURN.
+        ENDIF.
+        IF lv_do_record = abap_false AND is_req-transport IS NOT INITIAL.
+          cs_resp-status = 'error'.
+          APPEND 'TRANSPORT must be omitted when RECORD_TRANSPORT=false (direct-write mode)'
+            TO cs_resp-messages.
+          RETURN.
+        ENDIF.
+      WHEN 'A'.
+        IF is_req-transport IS NOT INITIAL.
+          cs_resp-status = 'error'.
+          APPEND |{ is_req-table } is delivery class A: TRANSPORT not applicable — omit it|
+            TO cs_resp-messages.
+          RETURN.
+        ENDIF.
+        lv_do_record = abap_false.
+      WHEN 'S' OR 'W' OR 'L'.
+        cs_resp-status = 'error'.
+        APPEND |Delivery class '{ lv_flag }': system/temp/local tables are not supported|
+          TO cs_resp-messages.
+        RETURN.
+      WHEN OTHERS.
+        cs_resp-status = 'error'.
+        APPEND |Delivery class '{ lv_flag }': C/G/E/A supported; S/W/L refused|
+          TO cs_resp-messages.
+        RETURN.
+    ENDCASE.
+
+    lv_grp = auth_group( is_req-table ).
+    AUTHORITY-CHECK OBJECT 'S_TABU_DIS'
+      ID 'DICBERCLS' FIELD lv_grp
+      ID 'ACTVT'     FIELD '02'.
+    IF sy-subrc <> 0.
+      cs_resp-status = 'error'.
+      APPEND |Not authorized: S_TABU_DIS / { lv_grp } / 02|
+        TO cs_resp-messages.
+      RETURN.
+    ENDIF.
+
     " Build tabkeys for all planned rows (needed for both paths)
     LOOP AT <plan> ASSIGNING <row>.
       CREATE DATA lr_one LIKE <row>.
@@ -954,38 +992,33 @@ CLASS zcl_mcp_cust_engine IMPLEMENTATION.
 
     IF lv_do_record = abap_true.
       " ── Batch-job path: job handles ENQUEUE/TR_OBJECTS_INSERT/MODIFY/COMMIT ──
-      " The ICF handler has no batch context; the job runs with sy-batch='X'.
-      " Work on a local copy of the request so we can inject an auto-created
-      " transport without mutating the IMPORTING parameter.
       DATA(ls_wreq) = is_req.
       DATA: lv_utask    TYPE trkorr,
             lv_ureq     TYPE trkorr,
             lv_tcreated TYPE abap_bool,
             lv_tmsg     TYPE string.
       IF lv_autocreate = abap_true.
-        " Use the caller-supplied request text if given, else an auto text.
         DATA(lv_tr_text) = COND as4text(
           WHEN is_req-transport_text IS NOT INITIAL
             THEN CONV as4text( is_req-transport_text )
-          ELSE |MCP cust { is_req-table } { is_req-source_key }->{ is_req-target_key }| ).
+          WHEN is_req-source_key IS NOT INITIAL
+            THEN |MCP cust { is_req-table } { is_req-source_key }->{ is_req-target_key }|
+          ELSE |MCP cust create { is_req-table }| ).
         create_cust_transport(
           EXPORTING iv_text    = lv_tr_text
           IMPORTING ev_request = DATA(lv_req)
                     ev_task    = DATA(lv_task) ).
         IF lv_req IS INITIAL.
-          rs_resp-status = 'error'.
+          cs_resp-status = 'error'.
           APPEND 'Could not create a Customizing request (TR_INSERT_REQUEST_WITH_TASKS failed)'
-            TO rs_resp-messages.
+            TO cs_resp-messages.
           RETURN.
         ENDIF.
-        ls_wreq-transport = lv_task.       " record objects onto the cust task
-        rs_resp-transport = lv_req.        " report the request (what gets released)
-        APPEND |Created Customizing request { lv_req } (task { lv_task })| TO rs_resp-messages.
+        ls_wreq-transport = lv_task.
+        cs_resp-transport = lv_req.
+        APPEND |Created Customizing request { lv_req } (task { lv_task })| TO cs_resp-messages.
 
       ELSEIF is_req-transport IS NOT INITIAL.
-        " Caller supplied a transport. Resolve the user's task under it (the SM30
-        " runtime records onto a task, not a request head) — creating one when the
-        " user has none, so a supplied request the user has no task in still works.
         ensure_user_task(
           EXPORTING iv_transport = CONV trkorr( is_req-transport )
           IMPORTING ev_task      = lv_utask
@@ -993,15 +1026,15 @@ CLASS zcl_mcp_cust_engine IMPLEMENTATION.
                     ev_created   = lv_tcreated
                     ev_msg       = lv_tmsg ).
         IF lv_tmsg IS NOT INITIAL.
-          rs_resp-status = 'error'.
-          APPEND lv_tmsg TO rs_resp-messages.
+          cs_resp-status = 'error'.
+          APPEND lv_tmsg TO cs_resp-messages.
           RETURN.
         ENDIF.
-        ls_wreq-transport = lv_utask.      " record onto the user's task
-        rs_resp-transport = lv_ureq.       " report the parent request
+        ls_wreq-transport = lv_utask.
+        cs_resp-transport = lv_ureq.
         IF lv_tcreated = abap_true.
           APPEND |Created customizing task { lv_utask } for { sy-uname } under request { lv_ureq }|
-            TO rs_resp-messages.
+            TO cs_resp-messages.
         ENDIF.
       ENDIF.
 
@@ -1009,30 +1042,30 @@ CLASS zcl_mcp_cust_engine IMPLEMENTATION.
       CALL METHOD me->submit_batch_write
         EXPORTING
           is_req    = ls_wreq
-          ir_plan   = lr_plan
+          ir_plan   = ir_plan
           it_keys   = lt_keys
         CHANGING
-          ct_messages = rs_resp-messages
+          ct_messages = cs_resp-messages
         RECEIVING
           rs_res    = ls_br.
 
       IF ls_br-pending = abap_true.
-        rs_resp-status = 'pending'.
-        rs_resp-run_id = ls_br-run_id.
+        cs_resp-status = 'pending'.
+        cs_resp-run_id = ls_br-run_id.
         APPEND |Job submitted — run_id { ls_br-run_id } (poll customizing_status)|
-          TO rs_resp-messages.
+          TO cs_resp-messages.
       ELSEIF ls_br-ok = abap_true.
-        rs_resp-status       = 'ok'.
-        rs_resp-rows_written = ls_br-rows_written.
+        cs_resp-status       = 'ok'.
+        cs_resp-rows_written = ls_br-rows_written.
         IF lv_cl_norecord = abap_true.
           APPEND |Written { ls_br-rows_written } row(s) via the view runtime (client { sy-mandt } records no transport)|
-            TO rs_resp-messages.
+            TO cs_resp-messages.
         ELSE.
-          APPEND |Written { ls_br-rows_written } row(s) → { rs_resp-transport } ({ ls_br-e071k_count } E071K entries)|
-            TO rs_resp-messages.
+          APPEND |Written { ls_br-rows_written } row(s) → { cs_resp-transport } ({ ls_br-e071k_count } E071K entries)|
+            TO cs_resp-messages.
         ENDIF.
       ELSE.
-        rs_resp-status = 'error'.
+        cs_resp-status = 'error'.
       ENDIF.
     ELSE.
       " ── Direct-write path: class A or explicit RECORD_TRANSPORT=false ────────
@@ -1046,28 +1079,195 @@ CLASS zcl_mcp_cust_engine IMPLEMENTATION.
           system_failure = 2
           OTHERS         = 3.
       IF sy-subrc <> 0.
-        rs_resp-status = 'error'.
+        cs_resp-status = 'error'.
         APPEND |ENQUEUE failed for { is_req-table } (subrc { sy-subrc })|
-          TO rs_resp-messages.
+          TO cs_resp-messages.
         RETURN.
       ENDIF.
 
       TRY.
           MODIFY (is_req-table) FROM TABLE <plan>.
-          rs_resp-rows_written = sy-dbcnt.
+          cs_resp-rows_written = sy-dbcnt.
           COMMIT WORK AND WAIT.
-          rs_resp-status = 'ok'.
-          APPEND |Written { rs_resp-rows_written } row(s) (direct, no transport)|
-            TO rs_resp-messages.
+          cs_resp-status = 'ok'.
+          APPEND |Written { cs_resp-rows_written } row(s) (direct, no transport)|
+            TO cs_resp-messages.
         CATCH cx_root INTO DATA(lx_wr).
           ROLLBACK WORK.
-          rs_resp-status = 'error'.
-          APPEND |Commit failed: { lx_wr->get_text( ) }| TO rs_resp-messages.
+          cs_resp-status = 'error'.
+          APPEND |Commit failed: { lx_wr->get_text( ) }| TO cs_resp-messages.
       ENDTRY.
 
       CALL FUNCTION 'DEQUEUE_E_TABLE'
         EXPORTING mode_rstable = 'E' tabname = lv_enq.
     ENDIF.
+  ENDMETHOD.
+
+
+  METHOD handle_create.
+    " Build a plan of rows from explicit field/value maps (full key, no source)
+    " and commit it through the shared commit_plan path. Supports composite keys
+    " and distinct per-row values — what the single-key copy (handle_write) can't.
+    DATA: lr_plan TYPE REF TO data,
+          lr_new  TYPE REF TO data,
+          lv_flag TYPE dd02l-contflag.
+    FIELD-SYMBOLS: <plan> TYPE STANDARD TABLE,
+                   <new>  TYPE any,
+                   <fld>  TYPE any.
+
+    " rows_json = JSON array of rows; each row a JSON array of {FIELD,VALUE}.
+    TYPES: ty_prow  TYPE STANDARD TABLE OF ty_field_value WITH DEFAULT KEY.
+    DATA lt_rows TYPE STANDARD TABLE OF ty_prow WITH DEFAULT KEY.
+
+    rs_resp-operation = 'create'.
+    rs_resp-table     = is_req-table.
+    rs_resp-transport = is_req-transport.
+    rs_resp-dry_run   = COND #( WHEN is_req-commit = abap_true
+                                THEN abap_false ELSE abap_true ).
+
+    IF is_valid_name( is_req-table ) = abap_false.
+      rs_resp-status = 'error'.
+      APPEND 'Invalid table name' TO rs_resp-messages.
+      RETURN.
+    ENDIF.
+    IF is_req-rows_json IS INITIAL.
+      rs_resp-status = 'error'.
+      APPEND 'ROWS_JSON is required (a JSON array of rows, each an array of {FIELD,VALUE})'
+        TO rs_resp-messages.
+      RETURN.
+    ENDIF.
+
+    TRY.
+        /ui2/cl_json=>deserialize(
+          EXPORTING json        = is_req-rows_json
+                    pretty_name = /ui2/cl_json=>pretty_mode-none
+          CHANGING  data        = lt_rows ).
+      CATCH cx_root INTO DATA(lx_rj).
+        rs_resp-status = 'error'.
+        APPEND |Cannot parse ROWS_JSON: { lx_rj->get_text( ) }| TO rs_resp-messages.
+        RETURN.
+    ENDTRY.
+    IF lines( lt_rows ) = 0.
+      rs_resp-status = 'error'.
+      APPEND 'ROWS_JSON contained no rows' TO rs_resp-messages.
+      RETURN.
+    ENDIF.
+
+    TRY.
+        CREATE DATA lr_plan TYPE STANDARD TABLE OF (is_req-table).
+        ASSIGN lr_plan->* TO <plan>.
+      CATCH cx_root INTO DATA(lx_ce).
+        rs_resp-status = 'error'.
+        APPEND |Cannot type table { is_req-table }: { lx_ce->get_text( ) }|
+          TO rs_resp-messages.
+        RETURN.
+    ENDTRY.
+
+    " ── Build each row from its field/value pairs ─────────────────────────────
+    LOOP AT lt_rows INTO DATA(lt_fields).
+      CREATE DATA lr_new LIKE LINE OF <plan>.
+      ASSIGN lr_new->* TO <new>.
+      CLEAR <new>.
+      LOOP AT lt_fields INTO DATA(ls_fv).
+        IF is_valid_name( ls_fv-field ) = abap_false.
+          rs_resp-status = 'error'.
+          APPEND |Invalid field name '{ ls_fv-field }'| TO rs_resp-messages.
+          RETURN.
+        ENDIF.
+        ASSIGN COMPONENT to_upper( ls_fv-field ) OF STRUCTURE <new> TO <fld>.
+        IF sy-subrc <> 0.
+          rs_resp-status = 'error'.
+          APPEND |Field { ls_fv-field } not found in { is_req-table }| TO rs_resp-messages.
+          RETURN.
+        ENDIF.
+        TRY.
+            <fld> = ls_fv-value.
+          CATCH cx_root.
+            rs_resp-status = 'error'.
+            APPEND |Value '{ ls_fv-value }' for { ls_fv-field } does not convert to the field type|
+              TO rs_resp-messages.
+            RETURN.
+        ENDTRY.
+      ENDLOOP.
+
+      " ONLY_MISSING: skip rows whose key already exists (idempotent create)
+      IF is_req-only_missing = abap_true.
+        IF row_exists( iv_table = is_req-table ir_row = lr_new ) = abap_true.
+          CONTINUE.
+        ENDIF.
+      ENDIF.
+
+      APPEND <new> TO <plan>.
+    ENDLOOP.
+
+    rs_resp-rows_planned = lines( <plan> ).
+    lv_flag = delivery_class( is_req-table ).
+
+    " ── Dry run ───────────────────────────────────────────────────────────────
+    IF is_req-commit = abap_false.
+      rs_resp-status = 'ok'.
+      APPEND |DRY RUN — { rs_resp-rows_planned } row(s) planned| TO rs_resp-messages.
+      /ui2/cl_json=>serialize(
+        EXPORTING data        = <plan>
+                  pretty_name = /ui2/cl_json=>pretty_mode-none
+        RECEIVING r_json      = rs_resp-data_json ).
+      RETURN.
+    ENDIF.
+
+    IF rs_resp-rows_planned = 0.
+      rs_resp-status = 'ok'.
+      APPEND 'Nothing to create — all rows already present' TO rs_resp-messages.
+      RETURN.
+    ENDIF.
+
+    commit_plan( EXPORTING is_req  = is_req
+                           ir_plan = lr_plan
+                 CHANGING  cs_resp = rs_resp ).
+  ENDMETHOD.
+
+
+  METHOD row_exists.
+    DATA: lt_fields TYPE STANDARD TABLE OF dd03l,
+          lv_tab    TYPE tabname,
+          lv_where  TYPE string,
+          lv_cnt    TYPE i.
+    FIELD-SYMBOLS: <row> TYPE any,
+                   <fld> TYPE any.
+
+    ASSIGN ir_row->* TO <row>.
+    lv_tab = to_upper( iv_table ).
+
+    SELECT fieldname datatype FROM dd03l
+      INTO CORRESPONDING FIELDS OF TABLE lt_fields
+      WHERE tabname  = lv_tab
+        AND as4local = 'A'
+        AND keyflag  = 'X'
+        AND fieldname NOT LIKE '.%'
+      ORDER BY position.
+
+    LOOP AT lt_fields INTO DATA(ls_f).
+      IF ls_f-datatype = 'CLNT'.
+        CONTINUE.   " client handled implicitly by the SELECT
+      ENDIF.
+      ASSIGN COMPONENT ls_f-fieldname OF STRUCTURE <row> TO <fld>.
+      IF sy-subrc <> 0.
+        CONTINUE.
+      ENDIF.
+      DATA(lv_cond) = |{ ls_f-fieldname } = '{ esc_quote( CONV string( <fld> ) ) }'|.
+      IF lv_where IS INITIAL.
+        lv_where = lv_cond.
+      ELSE.
+        lv_where = |{ lv_where } AND { lv_cond }|.
+      ENDIF.
+    ENDLOOP.
+
+    IF lv_where IS INITIAL.
+      rv_ok = abap_false.
+      RETURN.
+    ENDIF.
+
+    SELECT COUNT(*) FROM (lv_tab) INTO lv_cnt WHERE (lv_where).
+    rv_ok = COND #( WHEN lv_cnt > 0 THEN abap_true ELSE abap_false ).
   ENDMETHOD.
 
 

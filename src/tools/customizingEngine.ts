@@ -33,7 +33,7 @@ import { rememberTransport, buildTransportPrompt } from "./transportGovernance"
 
 // Keys are lowercase — /ui2/cl_json deserialize maps case-insensitively.
 interface EngineRequest {
-  operation: "ping" | "read" | "write" | "delete" | "selftest" | "status" | "img_index_read" | "hana_memory" | "org_copy"
+  operation: "ping" | "read" | "write" | "create" | "delete" | "selftest" | "status" | "img_index_read" | "hana_memory" | "org_copy"
   table?: string
   key_field?: string
   source_key?: string
@@ -55,6 +55,7 @@ interface EngineRequest {
   action?: string             // org_copy: "COPY" | "DELE"
   org_unit?: string           // org_copy: org-key DOMAIN name (BUKRS, WERKS, VKORG, VTWEG, SPART, EKORG, …)
   values_json?: string        // write: JSON array of {FIELD,VALUE} overrides applied to every planned row
+  rows_json?: string          // create: JSON array of rows, each a JSON array of {FIELD,VALUE} (full key + data)
 }
 
 // ─── transport selection (governed workflow) ─────────────────────────────────
@@ -824,6 +825,166 @@ export async function handleCustomizingApply(args: {
   return { content: [{ type: "text" as const, text: lines.join("\n") }] }
 }
 
+// ─── customizing_create ───────────────────────────────────────────────────────
+// Create rows from explicit field/value maps (full key, no source row) through
+// the same recorded SM30 view-runtime path as customizing_apply. Unlike copy,
+// this handles composite keys and distinct per-row values — e.g. storage
+// locations T001L (WERKS+LGORT+LGOBE), one description per site.
+export async function handleCustomizingCreate(args: {
+  table: string
+  rows: Record<string, string>[]
+  transport?: string
+  onlyMissing?: boolean
+  commit?: boolean
+  recordTransport?: boolean
+  createTransport?: boolean
+  transportText?: string
+  showAllTransports?: boolean
+  autoDeploy?: boolean
+  icfPath?: string
+  connectionId?: string
+}) {
+  const commit = args.commit === true
+
+  if (!Array.isArray(args.rows) || args.rows.length === 0) {
+    return { content: [{ type: "text" as const, text:
+      `❌ rows is required: a non-empty array of { FIELD: value } objects (each object is one row, including all key fields).` }] }
+  }
+
+  // Auto-deploy the ABAP class if missing/outdated (default on)
+  let deployNote = ""
+  if (args.autoDeploy !== false) {
+    try {
+      const d = await ensureEngineClass(args.connectionId)
+      if (d.changed) deployNote = `(engine ${d.action} to v${ENGINE_VERSION})\n`
+    } catch (err) {
+      log("WARN", "auto-deploy of engine class failed", err)
+    }
+  }
+
+  // Resolve the maintenance object (same as customizing_apply) so a recorded
+  // write goes through the SM30 view runtime and records the right transport object.
+  let maintObject = ""
+  let transportObject = ""
+  let clusterName = ""
+  let resolveNote = ""
+  if (args.recordTransport !== false) {
+    try {
+      const client = await ensureConnected(args.connectionId)
+      const maint = await resolveMaint(client, args.table)
+      if (maint.maintObject && maint.recordObject) {
+        maintObject     = maint.maintObject
+        transportObject = maint.recordObject
+        clusterName     = maint.cluster ?? ""
+        const clusterNote = maint.cluster
+          ? ` — in view cluster ${maint.cluster} (records the member view ${maintObject} as R3TR VDAT)`
+          : ""
+        resolveNote = `(maint object ${maintObject} → R3TR ${transportObject}; table set ${maint.tables.join(" + ")}${clusterNote})\n`
+      } else {
+        if (commit) {
+          return { content: [{ type: "text" as const, text:
+            `❌ ${args.table} has no generated SM30/SM34 maintenance object, so a transport-recorded ` +
+            `write isn't possible (object type ${maint.objectType ?? "?"}). ` +
+            `Use recordTransport: false for a direct (untransported) write, or maintain it in SPRO.` }] }
+        }
+        resolveNote = `(no generated maintenance for ${args.table}; dry-run only)\n`
+      }
+    } catch (err) {
+      log("WARN", "maintenance-object resolution failed", err)
+    }
+  }
+
+  // Each row object → a JSON array of {FIELD,VALUE} (the engine's rows_json shape).
+  const rowsJson = JSON.stringify(
+    args.rows.map(r => Object.entries(r).map(([FIELD, VALUE]) => ({ FIELD, VALUE: String(VALUE) }))),
+  )
+
+  const body: EngineRequest = {
+    operation: "create",
+    table: args.table,
+    rows_json: rowsJson,
+    transport: args.transport,
+    only_missing: args.onlyMissing === false ? "" : "X",   // default true (idempotent create)
+    commit: commit ? "X" : "",
+    record_transport: args.recordTransport === false ? "" : "X",
+    create_transport: args.createTransport === true ? "X" : "",
+    view_name: maintObject,
+    transport_object: transportObject,
+    cluster_name: clusterName,
+  }
+
+  // ── Governed transport selection (shared interactive flow) ───────────────────
+  const reqType: "W" | "K" = "W"
+  if (commit && !args.transport && args.recordTransport !== false && !args.createTransport) {
+    const owner = args.showAllTransports ? undefined : getConnectionConfig(args.connectionId).username
+    const open = await listOpenRequests(args.connectionId, reqType, owner)
+    return { content: [{ type: "text" as const, text: buildTransportPrompt({
+      candidates: open,
+      ctsFunction: reqType,
+      contextLabel: `a recorded customizing create (${args.rows.length} row(s) into ${args.table})`,
+      canName: true,
+      extraDirectOption: "recordTransport: false for a direct, untransported write",
+      scopeNote: owner ? `your requests — pass showAllTransports: true for everyone's` : `all users`,
+      prefix: `${deployNote}${resolveNote}`,
+    }) }] }
+  }
+  if (args.transportText) body.transport_text = args.transportText
+
+  let r: EngineResponse
+  try {
+    r = await callEngine(args.connectionId, body, args.icfPath)
+  } catch (err) {
+    return { content: [{ type: "text" as const, text:
+      `❌ Engine call failed: ${String((err as Error).message ?? err)}\nRun customizing_engine_ping to diagnose.` }] }
+  }
+
+  // Async commit: poll the run within a budget under the MCP client's ceiling.
+  if (commit && r.STATUS === "pending" && r.RUN_ID) {
+    const runId = r.RUN_ID
+    const deadline = Date.now() + 25_000
+    while (Date.now() < deadline) {
+      await new Promise(res => setTimeout(res, 2_500))
+      let s: EngineResponse
+      try {
+        s = await callEngine(args.connectionId, { operation: "status", run_id: runId }, args.icfPath)
+      } catch { continue }
+      if (s.STATUS && s.STATUS !== "pending") {
+        r = { ...r, STATUS: s.STATUS, ROWS_WRITTEN: s.ROWS_WRITTEN ?? r.ROWS_WRITTEN,
+              MESSAGES: s.MESSAGES ?? r.MESSAGES, RUN_ID: undefined }
+        break
+      }
+    }
+  }
+
+  const isDry = r.DRY_RUN === "X" || !commit
+  if (commit && r.STATUS === "ok" && r.TRANSPORT) rememberTransport(reqType, r.TRANSPORT)
+
+  const lines: string[] = [
+    ...(deployNote ? [deployNote.trimEnd()] : []),
+    ...(resolveNote ? [resolveNote.trimEnd()] : []),
+    isDry ? `📋 DRY RUN — nothing written` : `✏️  COMMIT`,
+    `   Status:       ${r.STATUS}`,
+    `   Table:        ${r.TABLE}  (create ${args.rows.length} row(s))`,
+    `   Rows planned: ${r.ROWS_PLANNED ?? 0}`,
+    ...(commit ? [`   Rows written: ${r.ROWS_WRITTEN ?? 0}`, `   Transport:    ${r.TRANSPORT ?? "(none)"}`] : []),
+    ...(r.MESSAGES?.length ? ["", "   Messages:", ...r.MESSAGES.map(m => `     • ${m}`)] : []),
+  ]
+  if (isDry && r.DATA_JSON) {
+    try {
+      const rows = JSON.parse(r.DATA_JSON)
+      lines.push("", `   Planned rows (${Array.isArray(rows) ? rows.length : 0}):`)
+      lines.push("   " + JSON.stringify(rows, null, 2).split("\n").join("\n   "))
+    } catch { /* leave raw out if unparseable */ }
+    lines.push("", `   To apply: re-run with commit: true (+ transport, or recordTransport: false)`)
+  }
+  if (r.STATUS === "pending" && r.RUN_ID) {
+    lines.push("", `   ⏳ Job still running. Poll with: customizing_status runId: ${r.RUN_ID}`)
+  }
+  if (r.STATUS === "error") log("WARN", `customizing_create error on ${args.table}`, r.MESSAGES)
+
+  return { content: [{ type: "text" as const, text: lines.join("\n") }] }
+}
+
 // ─── customizing_status ─────────────────────────────────────────────────────────
 // Poll the result of an async write (customizing_apply commit) by its run_id.
 
@@ -1065,6 +1226,42 @@ export function registerCustomizingEngineTools(server: McpServer): void {
       }
     },
     handleCustomizingApply
+  )
+
+  server.registerTool(
+    "customizing_create",
+    {
+      title: "Create Customizing Rows",
+      description:
+        "Create new customizing rows from explicit field/value maps — full keys (including " +
+        "COMPOSITE keys) and distinct per-row values, with NO source row to copy from. " +
+        "This is what customizing_apply (a single-key copy) can't express: e.g. storage " +
+        "locations T001L (key WERKS+LGORT) each with their own LGOBE description.\n\n" +
+        "Each entry in `rows` is one row as a { FIELD: value } object and must include all " +
+        "key fields. Rows are written through the SM30 view runtime (VIEW_MAINTENANCE_SINGLE_ENTRY, " +
+        "INS→UPD fallback) so FK checks, events, change docs and transport recording run the " +
+        "standard way; INITIAL/blank non-key fields are allowed.\n\n" +
+        "DRY RUN by default — returns the planned rows. Set commit: true to write.\n" +
+        "  onlyMissing (default true) skips rows whose key already exists — idempotent create.\n" +
+        "  recordTransport: false → direct write, no transport (sandbox/test data); omit transport then.\n" +
+        "Delivery class C/G/E records onto a Customizing request (provide transport or createTransport); " +
+        "class A writes directly. Enforces S_TABU_DIS on the table.",
+      inputSchema: {
+        table:       z.string().describe("Table name (e.g. T001L, T001W). Its generated SM30 maintenance view is resolved automatically for recorded writes."),
+        rows:        z.array(z.record(z.string(), z.string())).describe("Array of rows; each a { FIELD: value } object including ALL key fields, e.g. [{ WERKS: \"GHDC\", LGORT: \"0001\", LGOBE: \"Goods Receipt\" }]."),
+        transport:        z.string().optional().describe("Existing open Customizing request to record into (used as-is, no prompt). If omitted on a recorded commit and createTransport is not set, the tool returns an interactive prompt."),
+        onlyMissing:      z.boolean().optional().describe("Only create rows whose key is absent (default: true = idempotent). false also updates existing rows."),
+        commit:           z.boolean().optional().describe("Actually write (default: false = dry run returning the planned rows)"),
+        recordTransport:  z.boolean().optional().describe("Record the write on a transport (default: true for C/G/E). Set false for a direct, untransported sandbox write — transport must be omitted then."),
+        createTransport:  z.boolean().optional().describe("Opt in to having the engine create a NEW Customizing request when none supplied (default: false — the tool first prompts). Combine with transportText to name it."),
+        transportText:    z.string().optional().describe("Short description for the engine-created Customizing request (only used with createTransport: true)."),
+        showAllTransports: z.boolean().optional().describe("When prompting for a transport, list ALL users' open requests instead of only your own (default: false)."),
+        autoDeploy:       z.boolean().optional().describe("Auto-deploy/update the engine class if missing or outdated (default: true)"),
+        icfPath:     z.string().optional().describe(`SICF path of the engine (default: ${ENGINE_ICF_PATH})`),
+        connectionId: z.string().optional().describe("SAP system connection ID"),
+      }
+    },
+    handleCustomizingCreate
   )
 
   server.registerTool(
