@@ -131,16 +131,16 @@ describe("unlock_abap_object", () => {
 // ─── create_abap_object ───────────────────────────────────────────────────────
 
 describe("create_abap_object", () => {
-  it("calls createObject with the right arguments", async () => {
+  it("normalises the bare object-type prefix to the full creatable typeId", async () => {
     const result = await handleCreateAbapObject({
-      objectType: "PROG",
+      objectType: "PROG", // bare prefix → must be normalised to PROG/P
       name: "ZPROG_NEW",
       description: "My new program",
       packageName: "ZDEV",
       transport: "CARX000123",
     })
     expect(mockClient.createObject).toHaveBeenCalledWith(
-      "PROG", "ZPROG_NEW", "ZDEV", "My new program",
+      "PROG/P", "ZPROG_NEW", "ZDEV", "My new program",
       "/sap/bc/adt/packages/ZDEV", undefined, "CARX000123"
     )
     expect(result.content[0].text).toContain("✅")

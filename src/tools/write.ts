@@ -187,6 +187,30 @@ export async function handleUnlockAbapObject(args: {
   return { content: [{ type: "text" as const, text: `🔓 Object unlocked: ${args.url}` }] }
 }
 
+// abap-adt-api's createObject only accepts the FULL creatable typeId
+// ("PROG/P", "CLAS/OC", …) — its CreatableTypes.get(objtype) returns undefined
+// for a bare prefix and throws "Unsupported object type". Accept the prefix too
+// and normalise it, so callers can pass "PROG"/"CLAS" naturally.
+const CREATABLE_TYPE_ALIASES: Record<string, string> = {
+  PROG: "PROG/P",   // executable program / report
+  CLAS: "CLAS/OC",  // global class
+  INTF: "INTF/OI",  // interface
+  FUGR: "FUGR/F",   // function group
+  TABL: "TABL/DT",  // transparent table
+  DTEL: "DTEL/DE",  // data element
+  DOMA: "DOMA/DO",  // domain
+  TTYP: "TTYP/DA",  // table type
+  VIEW: "VIEW/DV",  // view
+  DEVC: "DEVC/K",   // package
+  MSAG: "MSAG/N",   // message class
+  ENQU: "ENQU/DL",  // lock object
+  SHLP: "SHLP/DH",  // search help
+}
+function normalizeCreatableType(t: string): string {
+  if (t.includes("/")) return t // already a full typeId
+  return CREATABLE_TYPE_ALIASES[t.trim().toUpperCase()] ?? t // unknown → pass through; lib validates
+}
+
 export async function handleCreateAbapObject(args: {
   objectType: string
   name: string
@@ -199,6 +223,7 @@ export async function handleCreateAbapObject(args: {
 }) {
   const client = await ensureConnected(args.connectionId)
   const parentPath = args.parentPath ?? `/sap/bc/adt/packages/${args.packageName}`
+  const objectType = normalizeCreatableType(args.objectType)
 
   // Governed transport selection (function 'K'). Uses the package as the CTS
   // reference; a local package ($TMP) resolves to no transport. Best-effort —
@@ -209,7 +234,7 @@ export async function handleCreateAbapObject(args: {
   if (t.prompt) return { content: [{ type: "text" as const, text: t.prompt }] }
 
   await client.createObject(
-    args.objectType as any,
+    objectType as any,
     args.name,
     args.packageName,
     args.description,
@@ -226,7 +251,7 @@ export async function handleCreateAbapObject(args: {
   return {
     content: [{
       type: "text" as const,
-      text: `✅ Created ${args.objectType} ${args.name}\n` +
+      text: `✅ Created ${objectType} ${args.name}\n` +
         `Description: ${args.description}\nPackage: ${args.packageName}\n` +
         (t.transport ? `Transport: ${t.transport}\n` : "") +
         (t.note ? `${t.note}\n` : "") +
@@ -318,7 +343,7 @@ export function registerWriteTools(server: McpServer): void {
       title: "Create ABAP Object",
       description: "Create a new ABAP development object (program, class, function group, table, etc.) in a package. Governed transport selection applies (same as write_abap_object_source): a local package ($TMP) needs no transport; for a transportable package, reuses this session's last Workbench request or lists the valid open ones (createTransport: true to start a new one).",
       inputSchema: {
-        objectType: z.string().describe("ABAP object type: PROG/P, CLAS/OC, FUGR/F, TABL/DT, DTEL/DE, DOMA/DO, INTF/OI, etc."),
+        objectType: z.string().describe("ABAP object type. Full typeId (PROG/P, CLAS/OC, FUGR/F, TABL/DT, DTEL/DE, DOMA/DO, INTF/OI) or the bare prefix (PROG, CLAS, FUGR, TABL, DTEL, DOMA, INTF, …) — the bare form is normalised to the full typeId."),
         name: z.string().describe("Object name (e.g. Z_MY_PROGRAM)"),
         description: z.string().describe("Object short description"),
         packageName: z.string().describe("Target package (e.g. ZDEV_PKG)"),
