@@ -35,10 +35,17 @@ sales-org view in the assortment's `VKORG` context) and forced a re-load. Load e
    (`customizing_create` → T001L). *(headless)*
 5. **Assortments** — local already exist (step 3); add **general** assortments (WRS1 SOTYP C)
    + texts + **site assignments** (WRSZ; stores SONUT=A, DCs SONUT=B). *(headless customizing_create)*
-6. **Articles — LOAD COMPLETE, not basic-only.** Migration Cockpit Product/Article object:
-   basic (`S_MARA`) **+ sales views (`S_MVKE`) for EVERY sales org you'll sell/list in**
-   (BE01/ZA01/LS01 × channel) + tax (`S_MLAN`). ⚠️ Omitting `S_MVKE` = a basic article that
-   **cannot be listed**. Depends on: merchandise categories + sales orgs (step 1-2).
+6. **Articles — must be REAL RETAIL ARTICLES, loaded complete.** Two distinct traps, both hit:
+   - **`S_MARA-ATTYP` must be set (`00` single article).** Blank `ATTYP` → a generic material
+     with **no MAW1 article segment** → *not a retail material* (`MG 531`) → **cannot be listed
+     or sold**, and the retail sales BAPI rejects it. (On our box *all* materials had blank
+     ATTYP — no retail article existed.) This is fixed only at **creation**; you can't add the
+     article category to an existing material, so a wrong load means **re-create** (new project /
+     new article, the old material is junk).
+   - **`S_MVKE` sales views** for every sales org you'll sell/list in (BE01/ZA01/LS01 × channel),
+     `MTPOS` mandatory — omit and the article can't be listed.
+   Plus `S_MARA` basics (`MBRSH=1`) + tax (`S_MLAN`). Depends on: merchandise categories + sales
+   orgs (step 1-2). Filled example: [`docs/retail-samples/product-migration-example/`](retail-samples/product-migration-example/).
 7. **Listing** — list articles into assortments (`EXECUTE_LISTING_ART_ASSORT_RFC`, run in a
    **background job** — the FM issues dialog messages). It extends each article to the
    assortment's assigned sites (MARC) and writes WLK1. Depends on **both**: articles **with
@@ -408,7 +415,7 @@ added on the re-load. Per §0, fill the sales views **in the same load**.
 **Fill the template (Download Template → CSV):**
 | Sheet | Fields | Notes |
 |---|---|---|
-| **`S_MARA`** (`#FreeText_Mandatory`) | `PRODUCT`, `MTART`, **`MBRSH=1`**, `MATKL`, `MAKTX`, `SPRAS`, `MEINS`, `SPART`, **`EAN11`**, **`NUMTP`** | `MBRSH=1` (=Retail) is **mandatory** (`M3 099` "Enter an industry sector" if blank). The **main GTIN goes here in `EAN11`+`NUMTP`** (category, e.g. `HE`). |
+| **`S_MARA`** (`#FreeText_Mandatory`) | `PRODUCT`, `MTART`, **`ATTYP=00`**, **`MBRSH=1`**, `MATKL`, `MAKTX`, `SPRAS`, `MEINS`, `SPART`, **`EAN11`**, **`NUMTP`** | **`ATTYP` (article category) is the one that bit us hardest** — leave it blank and you get a **non-retail material** (no MAW1 article segment), which **cannot be listed or sold in IS-Retail** (`MG 531`/`WM 740` "not a retail material"). Set `ATTYP=00` (single article). `MBRSH=1` (=Retail) is also **mandatory** (`M3 099` if blank). Main GTIN goes here in `EAN11`+`NUMTP` (category e.g. `HE`). |
 | **`S_MVKE`** (sales views) | `PRODUCT`, `VKORG`, `VTWEG`, `VRKME`, **`MTPOS`** | **DO NOT skip this** — one row per **sales org × channel** you'll sell/list in (e.g. BE01/ZA01/LS01 × 10). `MTPOS` (item category group, e.g. `NORM`) is mandatory. **Without `S_MVKE` the article is basic-only and CANNOT be listed** (listing → `WM 028`). This was the omission that forced a re-load — see §0. |
 | **`S_MLAN`** (tax) | `ALAND`, `TATYP1`, `TAXM1` | Use the **box's real tax category** (check `TSTL` by departure country — here it's `TTX1`, *not* `MWST`), per departure country of the delivering sites. Tax is for pricing, **not** required for listing; LS had no category defined. |
 | **`S_MEAN`** | *(leave empty)* | The base-unit main EAN lives in `MARA-EAN11`, **not** here — S_MEAN has no main-flag column, so putting the EAN here triggers "**First specify the main EAN for the unit**". |
