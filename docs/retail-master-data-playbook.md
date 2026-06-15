@@ -80,7 +80,8 @@ files: [`docs/retail-samples/`](retail-samples/).
   classified (class type 035, OBTAB=BETR) or WB01 warns WN 112.
 - **→ The BP + CVI-customer layer a site needs IS creatable headlessly** (verified) — see
   **§6**. `BPSITE` turned out unnecessary; `FLCU00`/`FLCU01` alone make CVI build the
-  customer. Only the `T001W` site/plant record itself still needs the GUI (eCATT, §6.2).
+  customer. The `T001W` site/plant record itself is created via a **headless-generated WB01
+  batch-input session processed in SM35 foreground** — verified for all 12 sites (§6.2).
 
 ### 2b. Articles — field-selection mandatory fields with no BAPI slot (a cascade)
 - `BAPI_MATERIAL_MAINTAINDATA_RT` (the retail article BAPI behind MM41) creates fine
@@ -471,35 +472,60 @@ result with a fraction of the code — prefer it unless you specifically need th
   For a no-commit **dry run**, call the same logic with `BAPI_TRANSACTION_ROLLBACK` and
   surface the result via `cl_abap_unit_assert=>fail( msg = … )` (HARMLESS, nothing persists).
 
-### 6.2 The site master (T001W) — eCATT/SECATT recording of WB01
-With the BPs/customers in place, create the plants/sites via **eCATT/SECATT** recording of
-**WB01** — SAP's recommended route for objects with no Migration Cockpit object. eCATT
-drives the GUI like a user, so it clears the classification-popup + multi-tab walls that
-defeated the headless BDC (§2a), and the recording just **links the now-existing BP**
-(`WR02D-SITE_BP` = site ID) instead of creating one.
+### 6.2 ✅ The site master (T001W) — WB01 batch-input session + SM35 (VERIFIED, all 12 sites)
+With the BPs/customers in place (§6), the plants/sites are created from a **WB01 batch-input
+session generated headlessly, then processed in SM35 in the foreground**. This is the route
+that actually worked end-to-end for all 12 sites (6 DCs + 6 stores).
 
-**Recording steps** (`SECATT`):
-1. Create a test script (e.g. `ZRET_SITE_WB01`) → **record `WB01`** once with the `GHDC` values.
-2. **Parameterise** the fields below (name the params `V_*` to match the variant file, or
-   rename the CSV header to your params).
-3. Create a Test Configuration + **Test Data Container** and import
-   `docs/retail-samples/sites_ecatt_variants.csv` (12 variants, `;`-delimited, `VARIANT` first).
-4. Run the configuration over all variants → 12 sites.
+**Why not pure headless, and why not eCATT:**
+- **Pure `CALL TRANSACTION ... MODE 'N'` can never finish WB01.** Every site create hits the
+  "Copy Customizing for plant" screen (`SAPLPLANT_DISPLAY_CUSTOMIZING`, dynpro 1000, okcode
+  `=BSTV`, component LO-RFM-MD-SIT) which instantiates a `CL_GUI_CUSTOM_CONTAINER` in PBO →
+  with no front-end this raises `CNTL_ERROR` → `RAISE_EXCEPTION` dump, `CALL TRANSACTION`
+  returns `subrc=1001`. Unavoidable headlessly.
+- **eCATT (`SECATT`) was abandoned:** serializing the recorded script via
+  `CL_APL_ECATT_DOWNLOAD=>BUILD_XML_OF_OBJECT` returned only the attribute header with an
+  **empty `<SCRIPT>` body** (the recorded SAPGUI screens live in a command blob, not in that
+  XML), so it was not a usable BDC source.
+- **The fix = a batch-input session.** Generating it (`BDC_OPEN_GROUP` / `BDC_INSERT
+  tcode='WB01'` / `BDC_CLOSE_GROUP`) is fully headless; **processing it in SM35 "foreground /
+  display errors only"** runs under a real GUI, so the control instantiates and — since every
+  field and okcode is supplied — auto-advances with no user typing.
 
-**Parameter → WB01 field map** (constants `V_SPART=00`, `V_MATLED=0001`, `V_REFSITE` blank):
+**BDCDATA source = SHDB, not eCATT.** Record one DC create in tx `SHDB`, click **Program** to
+auto-generate a BDC report, then lift its `bdc_dynpro`/`bdc_field` sequence. The proven DC
+screen flow (and stores reuse it unchanged — `ZSTO` profile did **not** diverge):
 
-| eCATT param | WB01 field (screen) | value |
-|---|---|---|
-| `V_SITE`    | `WR02D-LOCNR` (0101)        | site ID |
-| `V_PROFILE` | `WR02D-BETRP` (0101)        | `ZDC` (DC) / `ZSTO` (store) |
-| `V_REFSITE` | `WR02D-REF_WKFIL` (0101)    | *blank* — no reference copy |
-| `V_SITE_BP` | `WR02D-SITE_BP` (0401)      | = site ID (links the pre-created BP) |
-| `V_BUKRS`   | `T001K-BUKRS` (0401)        | Z100 / Z200 / Z300 |
-| `V_EKORG`   | `T001W-EKORG` (0401)        | Z100 |
-| `V_VKORG`   | `T001W-VKORG` (0401)        | BE01 / ZA01 / LS01 |
-| `V_VTWEG`   | `T001W-VTWEG` (0401)        | 10 |
-| `V_SPART`   | `T001W-SPART` (0401)        | 00 (common division) |
-| `V_MATLED`  | `TCKM2-MATLED` (subscr 2150)| 0001 |
+| # | Program / dynpro | OKCode | Fields set |
+|---|---|---|---|
+| 1 | `SAPMWBE3` / 0101 | `ENTR` | `WR02D-LOCNR`=site, `WR02D-BETRP`=profile (`ZDC`/`ZSTO`) |
+| 2 | `SAPMWBE3` / 0401 (org tab)       | `=5400` | `WR02D-SITE_BP`=site, `T001K-BUKRS`, `T001W-EKORG/VKORG/VTWEG/SPART` |
+| 3 | `SAPMWBE3` / 0401 (valuation tab) | `=UPDA` (save) | `WRF1-BWVKO`=VKORG, `WRF1-BWVTW`=VTWEG, `TCKM2-MATLED`=0001, `T001K-MLAST`=2 |
+| 4 | `SAPLWR19` / 0100 (copy-rule popup) | `=ENTER` | `WR02D-REF_WKFIL`=2510, `TWRF2-WRKRG`=01 |
+| 5 | `SAPLPLANT_DISPLAY_CUSTOMIZING` / 1000 | `=BSTV` | — (the GUI-control screen; needs SM35 foreground) |
+| 6 | `SAPLSPO1` / 0100 | `=YES` | — |
+| 7 | `SAPLCLCA` / 0602 | `=ABBR` | — (skip classification copy) |
+| 8 | `SAPLSPO1` / 0600 | `=OPT1` | — (Set Material Ledger to Live) |
 
-Save with okcode `=UPDA`. Full flat site list (incl. address/city/postal) remains in
+**Per-site values** (constants for all: `EKORG`=Z100, `VTWEG`=10, `SPART`=00, `MATLED`=0001,
+`MLAST`=2, `REF_WKFIL`=2510; `WR02D-SITE_BP` = site ID, linking the pre-created BP):
+
+| group | sites (DC / store) | `BETRP` | `T001K-BUKRS` | `VKORG` |
+|---|---|---|---|---|
+| BE | GHDC,ANDC / GHST,ANST | ZDC / ZSTO | Z100 | BE01 |
+| ZA | CTDC,JBDC / CTST,JBST | ZDC / ZSTO | Z200 | ZA01 |
+| LS | MSDC,TYDC / MSST,TYST | ZDC / ZSTO | Z300 | LS01 |
+
+**Generator report** (`$TMP`, e.g. `ZMCP_SITE_BDC`): build the 8-step BDCDATA per site, skip
+sites already in `T001W` (`SELECT SINGLE werks ...`) for idempotency, `BDC_INSERT` each into a
+session (e.g. `ZSITES`), and run it via the §6.1 background-job-via-AUnit pattern. Then a human
+runs **`SM35` → select `ZSITES` → Process → "Display errors only"**. Verify with `T001W`
+(headers) + `T001K` (`BWKEY`=site → `BUKRS`).
+
+> ⚠️ **Connection gotcha:** the `mcp__abap__*` tools default to the **first** configured system
+> when `connectionId` is omitted. If CAR is listed first, omitting it silently targets CAR — which
+> has no `T001W` and no `WB01` (you'll see `CALL_TRANSACTION_NOT_FOUND` / "table does not exist").
+> **Always pass the intended `connectionId` explicitly** for the S/4 retail box.
+
+Full flat site list (incl. address/city/postal, carried on the BP) remains in
 `docs/retail-samples/sites_all_stores_dcs.csv`.
