@@ -471,9 +471,35 @@ result with a fraction of the code — prefer it unless you specifically need th
   For a no-commit **dry run**, call the same logic with `BAPI_TRANSACTION_ROLLBACK` and
   surface the result via `cl_abap_unit_assert=>fail( msg = … )` (HARMLESS, nothing persists).
 
-### 6.2 The site master (T001W) — next step
+### 6.2 The site master (T001W) — eCATT/SECATT recording of WB01
 With the BPs/customers in place, create the plants/sites via **eCATT/SECATT** recording of
 **WB01** — SAP's recommended route for objects with no Migration Cockpit object. eCATT
 drives the GUI like a user, so it clears the classification-popup + multi-tab walls that
-defeated the headless BDC (§2a). The recording references the now-existing BPs; the site
-data (12 rows, all WB01 fields) is in `docs/retail-samples/sites_all_stores_dcs.csv`.
+defeated the headless BDC (§2a), and the recording just **links the now-existing BP**
+(`WR02D-SITE_BP` = site ID) instead of creating one.
+
+**Recording steps** (`SECATT`):
+1. Create a test script (e.g. `ZRET_SITE_WB01`) → **record `WB01`** once with the `GHDC` values.
+2. **Parameterise** the fields below (name the params `V_*` to match the variant file, or
+   rename the CSV header to your params).
+3. Create a Test Configuration + **Test Data Container** and import
+   `docs/retail-samples/sites_ecatt_variants.csv` (12 variants, `;`-delimited, `VARIANT` first).
+4. Run the configuration over all variants → 12 sites.
+
+**Parameter → WB01 field map** (constants `V_SPART=00`, `V_MATLED=0001`, `V_REFSITE` blank):
+
+| eCATT param | WB01 field (screen) | value |
+|---|---|---|
+| `V_SITE`    | `WR02D-LOCNR` (0101)        | site ID |
+| `V_PROFILE` | `WR02D-BETRP` (0101)        | `ZDC` (DC) / `ZSTO` (store) |
+| `V_REFSITE` | `WR02D-REF_WKFIL` (0101)    | *blank* — no reference copy |
+| `V_SITE_BP` | `WR02D-SITE_BP` (0401)      | = site ID (links the pre-created BP) |
+| `V_BUKRS`   | `T001K-BUKRS` (0401)        | Z100 / Z200 / Z300 |
+| `V_EKORG`   | `T001W-EKORG` (0401)        | Z100 |
+| `V_VKORG`   | `T001W-VKORG` (0401)        | BE01 / ZA01 / LS01 |
+| `V_VTWEG`   | `T001W-VTWEG` (0401)        | 10 |
+| `V_SPART`   | `T001W-SPART` (0401)        | 00 (common division) |
+| `V_MATLED`  | `TCKM2-MATLED` (subscr 2150)| 0001 |
+
+Save with okcode `=UPDA`. Full flat site list (incl. address/city/postal) remains in
+`docs/retail-samples/sites_all_stores_dcs.csv`.
