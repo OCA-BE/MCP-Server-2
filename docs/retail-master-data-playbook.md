@@ -281,6 +281,44 @@ Work down this list; the first one that applies is usually it:
        trust it automatically and the XHR download just works.
    - Related: a download URL is built from `icm/host_name_full` (item 6) — keep the FQDN in
      the cert SAN, `icm/host_name_full`, DNS, and the browser URL **all identical**.
+   - **✅ Worked recipe (public CA cert into the ICM — verified end-to-end):**
+     1. Pick an FQDN under a domain you control (`<host>.<your-domain>`) and set it
+        **system-wide via `SAPFQDN` in `DEFAULT.PFL`** (so `SAPLOCALHOSTFULL =
+        $(SAPLOCALHOST).$(SAPFQDN)` and every generated URL uses it — cleaner than, and
+        removes the need for, a separate `icm/host_name_full`).
+     2. **DNS A record** `<host>.<your-domain>` → the box IP (a private/overlay/VPN IP is
+        fine — the cert validates the *name*, not the IP — so no `/etc/hosts` anywhere).
+     3. Issue the cert with `acme.sh` **DNS-01** (ZeroSSL/Let's Encrypt; DNS-01 needs no
+        inbound access). Gotcha: acme.sh defaults to **ECC** → files land in
+        `~/.acme.sh/<fqdn>_ecc/` (ECC is fine — CommonCryptoLib 8.5.x serves it; pass
+        `-k 2048` only if you want RSA).
+     4. **Complete the chain for `sapgenpse`** — acme.sh's `ca.cer` carries only the
+        *intermediate*, so `import_p12` fails *"certificate chain is incomplete, need
+        certificate of <root CA>"*. Append the root from your client trust store, e.g. macOS
+        `security find-certificate -a -c "<root CA CN>" -p
+        /System/Library/Keychains/SystemRootCertificates.keychain > root.pem` →
+        `cat ca.cer root.pem > fullca.pem`.
+     5. Bundle PKCS#12: `openssl pkcs12 -export -inkey <fqdn>.key -in <fqdn>.cer
+        -certfile fullca.pem -out sslcert.p12 -passout pass:<p12-pass>`.
+     6. Import into the **SSL server PSE** (`$SECUDIR/SAPSSLS.pse`) on the OS as `<sid>adm`.
+        **csh gotcha:** no inline `#` comment on the command — csh passes it as args
+        ("unrecognized parameters"). `setenv SECUDIR /usr/sap/<SID>/<inst>/sec` →
+        `sapgenpse import_p12 -p ./SAPSSLS.pse -x "" ./sslcert.p12` (enter `<p12-pass>`) →
+        `sapgenpse seclogin -p ./SAPSSLS.pse -x "" -O <sid>adm`. (A `seclogin: Couldn't open
+        PSE` here just means the import hadn't succeeded yet — fix the import first.)
+     7. **Reload only the ICM** (`SMICM → Administration → ICM → Exit Soft → Global`) — no
+        instance restart needed for a cert swap.
+     8. Verify: `curl -v https://<host>.<your-domain>:<https-port>/sap/public/ping` →
+        `SSL certificate verify ok`, SAN matches, `HTTP/2 200`. Public CA ⇒ browsers trust it
+        ⇒ the cockpit's HTTPS XHR download finally succeeds.
+   - **⚠ Restart pitfall (cost us a scare):** if you *do* restart the instance for a profile
+     change, bring the **ASCS (message-server) instance up first, then the PAS** —
+     `sapcontrol -nr <ascs> -function RestartInstance` then `-nr <pas>` (or `StartSystem`).
+     With `system/secure_communication = ON` (default on S/4 2025) internal comms are TLS;
+     restarting only the PAS leaves `disp+work` **YELLOW "Server not attached to message
+     server"** (`dev_disp`: `NiPConnect … :39<ascs> … Connection refused` to the msg-server
+     port). It's not a cert problem — just start the ASCS. (Hostname resolution and
+     `icm/host_name_full`/`SAPFQDN` are *not* the cause of that symptom.)
 
 ### 4.2 In-app workflow
 
