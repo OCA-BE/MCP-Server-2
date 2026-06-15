@@ -17,6 +17,35 @@ files: [`docs/retail-samples/`](retail-samples/).
 
 ---
 
+## 0. Loading sequence (dependency order — follow it, don't skip ahead)
+
+Each step depends on the ones above it. **The expensive mistake we actually made: loading
+articles before they were complete** — basic data only, no sales views — which made them
+**un-listable** (listing failed `WM 028 "material does not exist"` because there was no
+sales-org view in the assortment's `VKORG` context) and forced a re-load. Load each object
+**complete for what the next step needs.**
+
+1. **Org structure & customizing** — company codes, purch org, **sales orgs (BE01/ZA01/LS01)**,
+   distribution channels, divisions. *(headless engine)* — everything below needs these.
+2. **Merchandise categories** + **tax per country** + **site profiles** (ZDC/ZSTO). *(headless)*
+3. **Sites** (DCs + stores) — WB01 batch-input session + SM35 (§6.2). Side effects: each site
+   auto-gets a **local assortment** (WRS1 SOTYP A/B) and **inherits the reference plant's
+   storage locations**.
+4. **Storage locations** — only if you want a spec layout beyond the inherited ones
+   (`customizing_create` → T001L). *(headless)*
+5. **Assortments** — local already exist (step 3); add **general** assortments (WRS1 SOTYP C)
+   + texts + **site assignments** (WRSZ; stores SONUT=A, DCs SONUT=B). *(headless customizing_create)*
+6. **Articles — LOAD COMPLETE, not basic-only.** Migration Cockpit Product/Article object:
+   basic (`S_MARA`) **+ sales views (`S_MVKE`) for EVERY sales org you'll sell/list in**
+   (BE01/ZA01/LS01 × channel) + tax (`S_MLAN`). ⚠️ Omitting `S_MVKE` = a basic article that
+   **cannot be listed**. Depends on: merchandise categories + sales orgs (step 1-2).
+7. **Listing** — list articles into assortments (`EXECUTE_LISTING_ART_ASSORT_RFC`, run in a
+   **background job** — the FM issues dialog messages). It extends each article to the
+   assortment's assigned sites (MARC) and writes WLK1. Depends on **both**: articles **with
+   sales views** (step 6) **and** assortments **with site assignments** (step 5).
+
+---
+
 ## 1. What works headlessly (use these)
 
 - **Org-unit copy** — `org_copy` tool → `ECOP_ORG_UNITS_IN_THE_DARK` (the dark/no-dialog
@@ -358,7 +387,10 @@ Optional entry** (input-validation only; zero runtime impact; reversible).
 
 ### 4.3 ✅ Worked recipe — Articles via the **Product** object (staging), verified end-to-end
 
-Loaded the 5 sample articles on A4H/250 (S/4HANA 2025). The exact flow + every wall hit:
+Loaded the 5 sample articles on A4H/250 (S/4HANA 2025). The exact flow + every wall hit.
+⚠️ **First pass was incomplete** — only `S_MARA`/`S_MLAN` were filled, so the articles came
+out **basic-data-only** (no `MVKE`/`MARC`) and could not be listed; the `S_MVKE` row below was
+added on the re-load. Per §0, fill the sales views **in the same load**.
 
 **Setup**
 1. New migration project → **Staging Tables** (on 2025 "Files" project type is gone), dev
@@ -373,12 +405,14 @@ Loaded the 5 sample articles on A4H/250 (S/4HANA 2025). The exact flow + every w
    type" (HAWA), because purely-numeric numbers belong to the internal range. Keep your
    numbers in `PRODUCT` only as the **source correlation key**; SAP maps source→assigned.
 
-**Fill the template (Download Template → CSV; fill only these sheets, rest stay empty):**
+**Fill the template (Download Template → CSV):**
 | Sheet | Fields | Notes |
 |---|---|---|
 | **`S_MARA`** (`#FreeText_Mandatory`) | `PRODUCT`, `MTART`, **`MBRSH=1`**, `MATKL`, `MAKTX`, `SPRAS`, `MEINS`, `SPART`, **`EAN11`**, **`NUMTP`** | `MBRSH=1` (=Retail) is **mandatory** (`M3 099` "Enter an industry sector" if blank). The **main GTIN goes here in `EAN11`+`NUMTP`** (category, e.g. `HE`). |
-| **`S_MLAN`** (tax) | `ALAND`, `TATYP1`, `TAXM1` | e.g. `BE` / `MWST` / `1`. |
+| **`S_MVKE`** (sales views) | `PRODUCT`, `VKORG`, `VTWEG`, `VRKME`, **`MTPOS`** | **DO NOT skip this** — one row per **sales org × channel** you'll sell/list in (e.g. BE01/ZA01/LS01 × 10). `MTPOS` (item category group, e.g. `NORM`) is mandatory. **Without `S_MVKE` the article is basic-only and CANNOT be listed** (listing → `WM 028`). This was the omission that forced a re-load — see §0. |
+| **`S_MLAN`** (tax) | `ALAND`, `TATYP1`, `TAXM1` | Use the **box's real tax category** (check `TSTL` by departure country — here it's `TTX1`, *not* `MWST`), per departure country of the delivering sites. Tax is for pricing, **not** required for listing; LS had no category defined. |
 | **`S_MEAN`** | *(leave empty)* | The base-unit main EAN lives in `MARA-EAN11`, **not** here — S_MEAN has no main-flag column, so putting the EAN here triggers "**First specify the main EAN for the unit**". |
+| *(other sheets)* | *(empty)* | Fill `S_MARC`/`S_WLK2` too if you'd rather extend-to-site + list via the cockpit instead of the headless listing engine. |
 
 **Format gotchas that cost the most time**
 - **CRLF line endings are mandatory.** The downloaded template is a single header line with
