@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest"
 import {
   UNITS, findUnit, loadConfig, saveConfig, unitConfig, setUnitConfig,
   isFirstRun, resolveTarget, buildSetupPrompt, buildStatus,
+  icfNodeName, buildIcfSetupReport,
   type DeployConfig,
 } from "../src/tools/engineDeploy"
 
@@ -55,6 +56,27 @@ describe("resolveTarget", () => {
   it("non-transportable → $TMP", () => {
     expect(resolveTarget({})).toEqual({ ok: true, deploy: { transportable: false, package: "$TMP" } })
     expect(resolveTarget({ transportable: false })).toEqual({ ok: true, deploy: { transportable: false, package: "$TMP" } })
+  })
+})
+
+describe("SICF installer", () => {
+  it("derives the node name from the SICF path", () => {
+    expect(icfNodeName("/sap/bc/zmcp_diag")).toBe("ZMCP_DIAG")
+    expect(icfNodeName("/sap/bc/zmcp_cust")).toBe("ZMCP_CUST")
+  })
+  it("bakes node/handler/path/package into the generated report", () => {
+    const src = buildIcfSetupReport({
+      node: "ZMCP_DIAG", path: "/sap/bc/zmcp_diag", handler: "ZCL_MCP_DIAG",
+      docu: "MCP diagnostics", nodePackage: "ZMCP_DIAG",
+    })
+    expect(src).toContain("cl_icf_tree=>if_icf_tree~insert_node")  // create (not modify-only change_node)
+    expect(src).toContain("node_already_existing = 2")             // idempotent
+    expect(src).toContain("icf_name    = 'ZMCP_DIAG'")
+    expect(src).toContain("ls_handler = 'ZCL_MCP_DIAG'")
+    expect(src).toContain("url = '/sap/bc/zmcp_diag'")
+    expect(src).toContain("package     = 'ZMCP_DIAG'")
+    expect(src).toContain("ZMCP_ICF_LOG_ZMCP_DIAG")
+    expect(src).toContain("RISK LEVEL HARMLESS")   // run via AUnit
   })
 })
 

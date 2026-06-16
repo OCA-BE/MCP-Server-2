@@ -71,8 +71,14 @@ tier rule), managed by the **`engine_deploy`** tool:
   to transportable with a new package/transport.
 
 Config persists in `engine-deploy.json` (git-ignored — it holds env-specific
-package/transport). After a transportable deploy, register the unit's SICF node
-once (the tool reports which).
+package/transport). The unit's SICF node is registered **automatically** as part
+of the deploy: `engine_deploy` generates a one-shot installer report that calls
+`cl_icf_tree=>if_icf_tree~insert_node` (the *create* API — `change_node` only
+modifies an existing node, raising `SHTTP/061` otherwise) and runs it headlessly
+via a `RISK LEVEL HARMLESS` AUnit test whose `COMMIT WORK AND WAIT` hardens to
+the DB. The node lands in the unit's package, so a transportable unit's SICF
+node travels with the class. Re-running is idempotent (`node_already_existing`
+falls back to `change_node` to refresh the handler/active flag).
 
 ### Connected-target awareness (no failed calls)
 `capabilities.ts` derives a per-connection snapshot from the engine's ping/env
