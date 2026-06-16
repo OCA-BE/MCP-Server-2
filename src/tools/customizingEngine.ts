@@ -33,7 +33,7 @@ import { rememberTransport, buildTransportPrompt } from "./transportGovernance"
 
 // Keys are lowercase — /ui2/cl_json deserialize maps case-insensitively.
 interface EngineRequest {
-  operation: "ping" | "read" | "write" | "create" | "listing" | "delete" | "selftest" | "status" | "img_index_read" | "hana_memory" | "org_copy"
+  operation: "ping" | "read" | "write" | "create" | "listing" | "delete" | "selftest" | "status" | "img_index_read" | "hana_memory" | "abap_memory" | "org_copy"
   table?: string
   key_field?: string
   source_key?: string
@@ -475,6 +475,35 @@ export async function handleHanaMemory(args: {
     return { content: [{ type: "text" as const, text:
       `❌ hana_memory failed: ${msg}\n\nRun customizing_engine_ping to confirm the engine is live ` +
       `(this tool needs engine v0.9.8+; run customizing_engine_bootstrap if older).` }] }
+  }
+}
+
+// ─── abap_memory_report ───────────────────────────────────────────────────────
+// ABAP app-server side of box health: key kernel memory/box-health profile
+// parameters (PHYS_MEMSIZE, extended memory, heap, roll/paging, buffers, WP
+// counts) via C_SAPGPARAM. Companion to hana_memory_report (the DB side); on a
+// single-host AS+DB appliance, read both to reason about RAM over-commit/swap.
+export async function handleAbapMemory(args: {
+  icfPath?: string
+  connectionId?: string
+}) {
+  const path = args.icfPath ?? ENGINE_ICF_PATH
+  try {
+    const r = await callEngine(args.connectionId, { operation: "abap_memory" }, path)
+    if (r.STATUS !== "ok") {
+      return { content: [{ type: "text" as const, text:
+        `❌ abap_memory failed: ${(r.MESSAGES ?? []).join("; ") || "unknown error"}` }] }
+    }
+    let params: { NAME: string; VALUE: string }[] = []
+    if (r.DATA_JSON) { try { params = JSON.parse(r.DATA_JSON) } catch { params = [] } }
+    const out: string[] = [`ABAP AS memory parameters (engine v${r.VERSION ?? "?"}) — via C_SAPGPARAM`, ""]
+    for (const p of params) out.push(`   ${(p.NAME ?? "").padEnd(28)} ${p.VALUE ?? ""}`)
+    return { content: [{ type: "text" as const, text: out.join("\n") }] }
+  } catch (err) {
+    const msg = String((err as Error).message ?? err)
+    return { content: [{ type: "text" as const, text:
+      `❌ abap_memory failed: ${msg}\n\nRun customizing_engine_ping to confirm the engine is live ` +
+      `(this tool needs engine v0.9.16+; run customizing_engine_bootstrap if older).` }] }
   }
 }
 
@@ -1215,6 +1244,25 @@ export function registerCustomizingEngineTools(server: McpServer): void {
       }
     },
     handleHanaMemory
+  )
+
+  server.registerTool(
+    "abap_memory_report",
+    {
+      title: "ABAP App-Server Memory Report",
+      description:
+        "Report the ABAP application server's key kernel memory / box-health profile parameters " +
+        "(PHYS_MEMSIZE, em/initial_size_MB extended memory, abap/heap_area_*, ztta/roll_*, " +
+        "abap/buffersize, work-process counts) via C_SAPGPARAM — basis-only, so it works on any " +
+        "ABAP box. Companion to hana_memory_report: on a single-host AS+DB appliance, read BOTH " +
+        "and check that HANA global_allocation_limit + ABAP working memory + OS ≤ physical RAM " +
+        "(over-commit shows up as swap). Needs engine v0.9.16+.",
+      inputSchema: {
+        icfPath:      z.string().optional().describe(`SICF path of the engine (default: ${ENGINE_ICF_PATH})`),
+        connectionId: z.string().optional().describe("SAP system connection ID"),
+      }
+    },
+    handleAbapMemory
   )
 
   server.registerTool(

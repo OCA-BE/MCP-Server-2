@@ -172,6 +172,13 @@ CLASS zcl_mcp_cust_engine DEFINITION
     METHODS handle_hana_memory
       RETURNING VALUE(rs_resp) TYPE ty_response.
 
+    "! ABAP application-server memory & box-health snapshot: key kernel profile
+    "! parameters (PHYS_MEMSIZE, extended memory, heap, roll/paging, buffers,
+    "! work-process counts) read via C_SAPGPARAM — basis-only, portable to any
+    "! ABAP box. Complements handle_hana_memory (the DB side).
+    METHODS handle_abap_memory
+      RETURNING VALUE(rs_resp) TYPE ty_response.
+
     "! Copy or delete a whole organizational unit (company code, plant, sales
     "! org, channel, division, purchasing org, …) including ALL its dependent
     "! customizing, via SAP's standard entity copier — the same engine behind
@@ -337,6 +344,7 @@ CLASS zcl_mcp_cust_engine IMPLEMENTATION.
             WHEN 'status'.   ls_resp = handle_status( ls_req ).
             WHEN 'img_index_read'. ls_resp = handle_img_index_read( ls_req ).
             WHEN 'hana_memory'.    ls_resp = handle_hana_memory( ).
+            WHEN 'abap_memory'.    ls_resp = handle_abap_memory( ).
             WHEN 'org_copy'.       ls_resp = handle_org_copy( ls_req ).
             WHEN OTHERS.
               ls_resp-status = 'error'.
@@ -441,6 +449,56 @@ CLASS zcl_mcp_cust_engine IMPLEMENTATION.
       CATCH cx_sql_exception INTO DATA(lx).
         APPEND |{ iv_tag } ERR { lx->get_text( ) }| TO ct_lines.
     ENDTRY.
+  ENDMETHOD.
+
+
+  METHOD handle_abap_memory.
+    " Read key ABAP kernel memory / box-health parameters via C_SAPGPARAM
+    " (effective runtime values). Portable: C_SAPGPARAM is a kernel call on
+    " every ABAP box. Read-only.
+    TYPES: BEGIN OF ty_p,
+             name  TYPE string,
+             value TYPE string,
+           END OF ty_p.
+    DATA: lt_p     TYPE STANDARD TABLE OF ty_p,
+          ls_p     TYPE ty_p,
+          lt_names TYPE STANDARD TABLE OF string,
+          lv_name  TYPE c LENGTH 80,
+          lv_v     TYPE c LENGTH 255.
+
+    rs_resp-operation = 'abap_memory'.
+    rs_resp-version   = c_version.
+
+    lt_names = VALUE #(
+      ( `PHYS_MEMSIZE` )
+      ( `em/initial_size_MB` ) ( `em/global_area_MB` ) ( `em/blocksize_KB` ) ( `em/address_space_MB` )
+      ( `abap/heap_area_total` ) ( `abap/heap_area_dia` ) ( `abap/heap_area_nondia` )
+      ( `abap/heaplimit` ) ( `abap/swap_reserve` )
+      ( `ztta/roll_area` ) ( `ztta/roll_first` ) ( `ztta/roll_extension` )
+      ( `ztta/roll_extension_dia` ) ( `ztta/roll_extension_nondia` )
+      ( `rdisp/ROLL_MAXFS` ) ( `rdisp/ROLL_SHM` ) ( `rdisp/PG_MAXFS` ) ( `rdisp/PG_SHM` )
+      ( `abap/buffersize` ) ( `zcsa/table_buffer_area` ) ( `zcsa/db_max_buftab` )
+      ( `rsdb/ntab/ftabsize` ) ( `rsdb/ntab/entrycount` )
+      ( `rdisp/wp_no_dia` ) ( `rdisp/wp_no_btc` ) ( `rdisp/wp_no_upd` )
+      ( `rdisp/wp_no_enq` ) ( `rdisp/wp_no_spo` ) ( `rdisp/wp_max_no` )
+      ( `rdisp/max_wprun_time` ) ( `ztta/max_memreq_MB` ) ).
+
+    LOOP AT lt_names INTO DATA(lv_n).
+      lv_name = lv_n.
+      CLEAR lv_v.
+      CALL 'C_SAPGPARAM' ID 'NAME'  FIELD lv_name
+                         ID 'VALUE' FIELD lv_v.                 "#EC CI_CCALL
+      ls_p-name  = lv_n.
+      ls_p-value = lv_v.
+      APPEND ls_p TO lt_p.
+    ENDLOOP.
+
+    rs_resp-status = 'ok'.
+    APPEND |Read { lines( lt_p ) } ABAP kernel parameters via C_SAPGPARAM| TO rs_resp-messages.
+    /ui2/cl_json=>serialize(
+      EXPORTING data        = lt_p
+                pretty_name = /ui2/cl_json=>pretty_mode-none
+      RECEIVING r_json      = rs_resp-data_json ).
   ENDMETHOD.
 
 
