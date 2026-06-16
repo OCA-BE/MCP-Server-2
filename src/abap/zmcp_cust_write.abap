@@ -48,6 +48,8 @@ START-OF-SELECTION.
 
   IF ls_params-op = 'ORGCOPY'.
     PERFORM run_org_copy   USING ls_params CHANGING ls_result.
+  ELSEIF ls_params-op = 'LISTING'.
+    PERFORM run_listing    USING ls_params CHANGING ls_result.
   ELSEIF ls_params-view_name IS NOT INITIAL.
     PERFORM write_via_view USING ls_params CHANGING ls_result.
   ELSE.
@@ -167,6 +169,111 @@ FORM run_org_copy
   APPEND |{ lines( <tablist> ) } dependent tables processed by the entity copier (batch sy-batch='{ sy-batch }')|
     TO cs_result-messages.
   APPEND |Transport { lv_exp_req } / task { lv_exp_task } — { lv_keys } object keys on the task|
+    TO cs_result-messages.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*&  Retail listing engine in a background job (op='LISTING').
+*&  Runs EXECUTE_LISTING_ART_ASSORT_RFC with sy-batch='X', so the dialog
+*&  messages it issues (e.g. WM 028) are logged instead of aborting with
+*&  "cannot be processed in plugin mode HTTP" the way they do in the
+*&  synchronous ICF handler context. WINT_LISTING_ITEM_TAB is resolved
+*&  dynamically and the FM is called by literal name (runtime-resolved),
+*&  so this report still activates on non-retail boxes (e.g. CAR).
+*&---------------------------------------------------------------------*
+FORM run_listing
+  USING    is_params TYPE ty_params
+  CHANGING cs_result TYPE ty_result.
+
+  DATA: lr_all   TYPE REF TO data,
+        lr_sub   TYPE REF TO data,
+        lt_prods TYPE STANDARD TABLE OF matnr,
+        lv_prod  TYPE matnr,
+        lv_total TYPE i,
+        lv_done  TYPE i,
+        lv_err   TYPE i.
+  FIELD-SYMBOLS: <all>  TYPE STANDARD TABLE,
+                 <sub>  TYPE STANDARD TABLE,
+                 <line> TYPE any,
+                 <pf>   TYPE any.
+
+  TRY.
+      CREATE DATA lr_all TYPE ('WINT_LISTING_ITEM_TAB').
+      ASSIGN lr_all->* TO <all>.
+      CREATE DATA lr_sub TYPE ('WINT_LISTING_ITEM_TAB').
+      ASSIGN lr_sub->* TO <sub>.
+    CATCH cx_root.
+      cs_result-status = 'error'.
+      APPEND 'Listing item type WINT_LISTING_ITEM_TAB not available (not an IS-Retail system)'
+        TO cs_result-messages.
+      RETURN.
+  ENDTRY.
+
+  TRY.
+      /ui2/cl_json=>deserialize(
+        EXPORTING json        = is_params-plan_json
+                  pretty_name = /ui2/cl_json=>pretty_mode-none
+        CHANGING  data        = <all> ).
+    CATCH cx_root INTO DATA(lx).
+      cs_result-status = 'error'.
+      APPEND |Cannot parse listing items: { lx->get_text( ) }| TO cs_result-messages.
+      RETURN.
+  ENDTRY.
+
+  lv_total = lines( <all> ).
+  IF lv_total = 0.
+    cs_result-status = 'error'.
+    APPEND 'No listing items to process' TO cs_result-messages.
+    RETURN.
+  ENDIF.
+
+  " EXECUTE_LISTING_ART_ASSORT_RFC lists ONE article at a time: get_instance(iv_product)
+  " builds the single/generic-article lister + product family for that product, and
+  " raises WM 028 ("material does not exist") if iv_product is blank. So group the
+  " items by PRODUCT and call the FM once per article, passing that article's rows.
+  LOOP AT <all> ASSIGNING <line>.
+    ASSIGN COMPONENT 'PRODUCT' OF STRUCTURE <line> TO <pf>.
+    IF sy-subrc = 0. APPEND <pf> TO lt_prods. ENDIF.
+  ENDLOOP.
+  SORT lt_prods. DELETE ADJACENT DUPLICATES FROM lt_prods.
+
+  LOOP AT lt_prods INTO lv_prod.
+    CLEAR <sub>.
+    LOOP AT <all> ASSIGNING <line>.
+      ASSIGN COMPONENT 'PRODUCT' OF STRUCTURE <line> TO <pf>.
+      IF sy-subrc = 0 AND <pf> = lv_prod.
+        APPEND <line> TO <sub>.
+      ENDIF.
+    ENDLOOP.
+
+    CALL FUNCTION 'EXECUTE_LISTING_ART_ASSORT_RFC'
+      EXPORTING
+        it_products_assort       = <sub>
+        iv_product               = lv_prod
+        iv_all_assort            = space
+        iv_recheck               = 'X'
+        iv_determine_data        = 'X'
+        iv_selection_string      = space
+        iv_include_local_assorts = 'X'
+      EXCEPTIONS
+        fatal_error              = 1
+        OTHERS                   = 2.
+    IF sy-subrc <> 0.
+      lv_err = lv_err + 1.
+      APPEND |Article { lv_prod ALPHA = OUT }: listing fatal_error (subrc { sy-subrc })|
+        TO cs_result-messages.
+      CONTINUE.   " keep processing the remaining articles
+    ENDIF.
+    lv_done = lv_done + lines( <sub> ).
+    APPEND |Article { lv_prod ALPHA = OUT }: { lines( <sub> ) } assortment(s) listed|
+      TO cs_result-messages.
+  ENDLOOP.
+
+  COMMIT WORK AND WAIT.
+  cs_result-status       = COND #( WHEN lv_done > 0 THEN 'ok' ELSE 'error' ).
+  cs_result-rows_written = lv_done.
+  APPEND |Listed { lv_done } of { lv_total } article/assortment item(s) across { lines( lt_prods ) } | &&
+         |article(s) in batch (sy-batch='{ sy-batch }'); { lv_err } article(s) errored — segments + WLK1 written|
     TO cs_result-messages.
 ENDFORM.
 

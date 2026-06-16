@@ -261,6 +261,16 @@ CLASS zcl_mcp_cust_engine DEFINITION
       CHANGING  ct_messages    TYPE stringtab
       RETURNING VALUE(rs_res)  TYPE ty_batch_result.
 
+    "! Run the retail listing engine (EXECUTE_LISTING_ART_ASSORT_RFC) in a
+    "! background job so the dialog messages it issues (e.g. WM 028) are logged
+    "! instead of aborting in the HTTP/ICF context. iv_items_json is the
+    "! serialized WINT_LISTING_ITEM_TAB. Same INDX(ZP/ZR)+poll contract as
+    "! submit_org_copy; returns pending+run_id if the job outlives the poll.
+    METHODS submit_listing
+      IMPORTING iv_items_json  TYPE string
+      CHANGING  ct_messages    TYPE stringtab
+      RETURNING VALUE(rs_res)  TYPE ty_batch_result.
+
     "! Create a modifiable Customizing request (TRFUNCTION 'W') owned by the
     "! current user. Customizing view data (R3TR VDAT) can only be recorded into
     "! a customizing request, not a workbench one. Returns the request trkorr
@@ -1387,7 +1397,8 @@ CLASS zcl_mcp_cust_engine IMPLEMENTATION.
            END OF ty_item_in.
     DATA: lt_in    TYPE STANDARD TABLE OF ty_item_in WITH DEFAULT KEY,
           lr_items TYPE REF TO data,
-          lr_line  TYPE REF TO data.
+          lr_line  TYPE REF TO data,
+          lv_matnr TYPE matnr.
     FIELD-SYMBOLS: <items> TYPE STANDARD TABLE,
                    <line>  TYPE any,
                    <fld>   TYPE any.
@@ -1433,7 +1444,19 @@ CLASS zcl_mcp_cust_engine IMPLEMENTATION.
       ASSIGN lr_line->* TO <line>.
       CLEAR <line>.
       ASSIGN COMPONENT 'PRODUCT' OF STRUCTURE <line> TO <fld>.
-      IF sy-subrc = 0. <fld> = |{ ls_in-product ALPHA = IN }|. ENDIF.
+      IF sy-subrc = 0.
+        " Use the MATERIAL number conversion (not plain ALPHA): a classic numeric
+        " article is stored 18-char zero-padded (e.g. 000000000000000156), NOT
+        " left-padded across the full 40-char MATNR field. Plain ALPHA on c40
+        " yields 38 zeros + 156, which never matches MARA → cl_listing_app
+        " get_product_data finds nothing → WM 028 → job abort.
+        CLEAR lv_matnr.
+        CALL FUNCTION 'CONVERSION_EXIT_MATN1_INPUT'
+          EXPORTING input  = ls_in-product
+          IMPORTING output = lv_matnr
+          EXCEPTIONS OTHERS = 1.
+        <fld> = COND #( WHEN sy-subrc = 0 THEN lv_matnr ELSE |{ ls_in-product ALPHA = IN }| ).
+      ENDIF.
       ASSIGN COMPONENT 'ASSORTMENT' OF STRUCTURE <line> TO <fld>.
       IF sy-subrc = 0. <fld> = ls_in-assortment. ENDIF.
       ASSIGN COMPONENT 'DATE_FROM' OF STRUCTURE <line> TO <fld>.
@@ -1458,28 +1481,37 @@ CLASS zcl_mcp_cust_engine IMPLEMENTATION.
       RETURN.
     ENDIF.
 
-    CALL FUNCTION 'EXECUTE_LISTING_ART_ASSORT_RFC'
-      EXPORTING
-        it_products_assort       = <items>
-        iv_product               = space
-        iv_all_assort            = space
-        iv_recheck               = 'X'
-        iv_determine_data        = 'X'
-        iv_selection_string      = space
-        iv_include_local_assorts = 'X'
-      EXCEPTIONS
-        fatal_error              = 1
-        OTHERS                   = 2.
-    IF sy-subrc <> 0.
-      ROLLBACK WORK.
-      rs_resp-status = 'error'.
-      APPEND |Listing engine raised fatal_error (subrc { sy-subrc })| TO rs_resp-messages.
+    " ── Commit: run the listing engine in a BACKGROUND JOB. Synchronously in the
+    " ICF/HTTP context the FM aborts with "Message <type> WM 028 cannot be
+    " processed in plugin mode HTTP" — it issues dialog messages that the HTTP
+    " plugin can't display. Under sy-batch='X' those are logged, not popped, so
+    " the listing completes. If the job outlives the short poll it returns
+    " pending + run_id and the caller polls 'status' (same contract as org_copy).
+    DATA lv_items_json TYPE string.
+    /ui2/cl_json=>serialize(
+      EXPORTING data        = <items>
+                pretty_name = /ui2/cl_json=>pretty_mode-none
+      RECEIVING r_json      = lv_items_json ).
+
+    DATA(ls_res) = submit_listing(
+      EXPORTING iv_items_json = lv_items_json
+      CHANGING  ct_messages   = rs_resp-messages ).
+
+    IF ls_res-pending = abap_true.
+      rs_resp-status = 'pending'.
+      rs_resp-run_id = ls_res-run_id.
+      APPEND |Listing running as a background job — run_id { ls_res-run_id } (poll customizing_status)|
+        TO rs_resp-messages.
       RETURN.
     ENDIF.
 
-    COMMIT WORK AND WAIT.
+    IF ls_res-ok = abap_false.
+      rs_resp-status = 'error'.   " submit_listing already appended the failure detail
+      RETURN.
+    ENDIF.
+
     rs_resp-status       = 'ok'.
-    rs_resp-rows_written = rs_resp-rows_planned.
+    rs_resp-rows_written = ls_res-rows_written.
     APPEND |Listed { rs_resp-rows_planned } article/assortment item(s) (segments determined + WLK1 written)|
       TO rs_resp-messages.
   ENDMETHOD.
@@ -2319,6 +2351,103 @@ CLASS zcl_mcp_cust_engine IMPLEMENTATION.
       rs_res-rows_written = ls_jres-rows_written.
       rs_res-e071k_count  = ls_jres-e071k_count.
       rs_res-transport    = ls_jres-transport.
+    ENDIF.
+  ENDMETHOD.
+
+
+  METHOD submit_listing.
+    " Same job/INDX/poll contract as submit_org_copy, but the params drive the
+    " report's op='LISTING' branch (EXECUTE_LISTING_ART_ASSORT_RFC in batch).
+    " The serialized WINT_LISTING_ITEM_TAB rides in plan_json; no tabkeys/org
+    " fields. MUST match the report's ty_params field-for-field and in the SAME
+    " ORDER — EXPORT/IMPORT ... TO/FROM DATABASE is positional.
+    TYPES: BEGIN OF ty_params,
+             op               TYPE string,
+             table_name       TYPE string,
+             view_name        TYPE string,
+             transport_object TYPE string,
+             cluster_name     TYPE string,
+             transport        TYPE string,
+             action           TYPE string,
+             plan_json        TYPE string,
+             tabkeys_json     TYPE string,
+             org_unit         TYPE string,
+             source_orgunit   TYPE string,
+             target_orgunit   TYPE string,
+           END OF ty_params.
+
+    DATA: ls_params   TYPE ty_params,
+          ls_jres     TYPE ty_jres,
+          lv_run_id   TYPE c LENGTH 22,
+          lv_jobname  TYPE btcjob,
+          lv_jobcount TYPE btcjobcnt.
+
+    TRY.
+        lv_run_id = cl_system_uuid=>create_uuid_c22_static( ).
+      CATCH cx_uuid_error.
+        CONCATENATE sy-mandt sy-datum sy-uzeit INTO lv_run_id.
+    ENDTRY.
+
+    ls_params-op        = 'LISTING'.
+    ls_params-plan_json = iv_items_json.   " serialized WINT_LISTING_ITEM_TAB
+
+    EXPORT data = ls_params TO DATABASE indx(ZP) ID lv_run_id.
+
+    lv_jobname = 'ZMCP_CUST_WRITE'.
+    CALL FUNCTION 'JOB_OPEN'
+      EXPORTING  jobname         = lv_jobname
+      IMPORTING  jobcount        = lv_jobcount
+      EXCEPTIONS cant_create_job = 1
+                 OTHERS          = 2.
+    IF sy-subrc <> 0.
+      APPEND |JOB_OPEN failed (subrc { sy-subrc }) — cannot schedule the listing engine|
+        TO ct_messages.
+      DELETE FROM DATABASE indx(ZP) ID lv_run_id.
+      RETURN.
+    ENDIF.
+
+    SUBMIT zmcp_cust_write WITH p_runid = lv_run_id
+      VIA JOB lv_jobname NUMBER lv_jobcount AND RETURN.
+
+    CALL FUNCTION 'JOB_CLOSE'
+      EXPORTING jobname               = lv_jobname
+                jobcount              = lv_jobcount
+                strtimmed             = 'X'
+      EXCEPTIONS cant_start_immediate = 1
+                 invalid_starttime    = 2
+                 OTHERS               = 3.
+    IF sy-subrc <> 0.
+      APPEND |JOB_CLOSE failed (subrc { sy-subrc }) — job may not start|
+        TO ct_messages.
+      DELETE FROM DATABASE indx(ZP) ID lv_run_id.
+      RETURN.
+    ENDIF.
+
+    DATA lv_done TYPE abap_bool VALUE abap_false.
+    DO 8 TIMES.
+      WAIT UP TO 1 SECONDS.
+      IMPORT data = ls_jres FROM DATABASE indx(ZR) ID lv_run_id.
+      IF sy-subrc = 0.
+        lv_done = abap_true.
+        EXIT.
+      ENDIF.
+    ENDDO.
+
+    IF lv_done = abap_false.
+      rs_res-pending = abap_true.
+      rs_res-run_id  = lv_run_id.
+      RETURN.
+    ENDIF.
+
+    DELETE FROM DATABASE indx(ZR) ID lv_run_id.
+
+    LOOP AT ls_jres-messages INTO DATA(lv_m).
+      APPEND lv_m TO ct_messages.
+    ENDLOOP.
+
+    IF ls_jres-status = 'ok'.
+      rs_res-ok           = abap_true.
+      rs_res-rows_written = ls_jres-rows_written.
     ENDIF.
   ENDMETHOD.
 

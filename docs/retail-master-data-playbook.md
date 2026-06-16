@@ -44,12 +44,33 @@ sales-org view in the assortment's `VKORG` context) and forced a re-load. Load e
      new article, the old material is junk).
    - **`S_MVKE` sales views** for every sales org you'll sell/list in (BE01/ZA01/LS01 × channel),
      `MTPOS` mandatory — omit and the article can't be listed.
+   - **Field-selection required fields in `S_MARA#FreeText_Mandatory`.** The retail article type's
+     field selection makes MAW1 fields mandatory; the cockpit *does* expose them, so **fill the
+     column** rather than relaxing OMS9 (see §2b). Minimum to clear the cascade: **`WLADG` (Loading
+     Group) = `0003`** (Manual; `TLGR`). Symptom if blank: *"field MAW1-WLADG is defined as a
+     required field; it does not have a value"*, one message per article.
    Plus `S_MARA` basics (`MBRSH=1`) + tax (`S_MLAN`). Depends on: merchandise categories + sales
    orgs (step 1-2). Filled example: [`docs/retail-samples/product-migration-example/`](retail-samples/product-migration-example/).
-7. **Listing** — list articles into assortments (`EXECUTE_LISTING_ART_ASSORT_RFC`, run in a
-   **background job** — the FM issues dialog messages). It extends each article to the
-   assortment's assigned sites (MARC) and writes WLK1. Depends on **both**: articles **with
-   sales views** (step 6) **and** assortments **with site assignments** (step 5).
+   **PROVEN 2026-06-16:** the cockpit assigns **internal** article numbers (our 5 file rows
+   `10000001-05` became MATNR **156-160**, FOOD/HAWA, ATTYP=00, MVKE for BE01/ZA01/LS01 ch10) —
+   so reference downstream steps by the assigned numbers, not the file's external numbers.
+7. **Listing** — list articles into assortments (`retail_listing` tool → `EXECUTE_LISTING_ART_ASSORT_RFC`).
+   It extends each article to the assortment's assigned sites (MARC) and writes WLK1. Depends on
+   **both**: articles **with sales views** (step 6) **and** assortments **with site assignments** (step 5).
+   Three traps, all proven on this box:
+   - **Runs only in a background job.** Synchronously in the HTTP/ICF context the FM aborts with
+     *"Message A WM 028 cannot be processed in plugin mode HTTP"* (it issues dialog messages). The
+     engine submits it as a batch job (`sy-batch='X'`) and returns a `run_id` to poll.
+   - **One article per FM call.** `cl_listing_app=>get_instance(iv_product)` builds an
+     article-specific lister; a blank/multi `iv_product` → `WM 028` ("material does not exist") →
+     unbound instance → type-A abort. The engine groups items by article and calls the FM per article.
+   - **Material number must be the canonical form.** Use `CONVERSION_EXIT_MATN1_INPUT` (→
+     `000000000000000156`), not plain `ALPHA` on the 40-char field (→ 38 zeros+156), or `get_product_data`'s
+     `SELECT … WHERE matnr = iv_product` finds nothing → `WM 028`.
+   - **Articles need a listing procedure.** `MVKE-LSTFL` (store) / `MVKE-LSTVZ` (DC) must be set
+     (`TWLV`; `01` = standard default). Blank → `check_listing_rules` fails with `WM 006` ("enter
+     listing procedure") and the article is **silently disallowed** (FM completes, **0** WLK1
+     written). So `S_MVKE` must carry `LSTFL`/`LSTVZ` — the template ships `01` for this reason.
 
 ---
 
