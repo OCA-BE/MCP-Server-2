@@ -125,6 +125,12 @@ sales-org view in the assortment's `VKORG` context) and forced a re-load. Load e
   client-level fields mandatory that the BAPI has **no structure field for**: first
   `MARA-TAKLV` (tax classification), then `MAW1-WLADG` (loading group), … a cascade across
   multiple field references. Relaxing them in OMS9 unblocks one at a time.
+- **Via the migration cockpit, prefer supplying the value over relaxing OMS9.** Unlike the
+  BAPI, the cockpit's `S_MARA#FreeText_Mandatory` sheet *does* expose these MAW1 fields
+  (`WLADG`, `SSTUF`, `LSTFL`, `BBTYP`, …), so a mandatory `MAW1-WLADG` is fixed by putting a
+  valid **Loading Group** in that column — e.g. `0003` (Manual; values in `TLGR`/`TLGRT`:
+  0001 Crane / 0002 Forklift / 0003 Manual) — for every article row. No customizing change.
+  The `product-migration-example` template ships with `WLADG=0003` pre-filled for this reason.
 - RAP EML on **`A_Product_2`** (the `API_PRODUCT` BO, real public create) →
   **`CX_ABAP_BEHV_COMMIT_FAILED`** inside an AUnit test context, and a plain background job
   **ABENDs** — RAP create only runs cleanly in its **OData runtime**.
