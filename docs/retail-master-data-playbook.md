@@ -3,6 +3,9 @@
 Reusable knowledge from building an IS-Retail org structure + sample master data on an
 S/4HANA 2025+ **Customizing client** (CCCATEGORY='C') headlessly via abap-config-mcp.
 
+> **Current build inventory** (what actually exists on the demo box + how each layer was built):
+> see **[s4-retail-build-overview.md](s4-retail-build-overview.md)**. This file is the *how-to / gotchas*; the overview is the *what's-there*.
+
 **TL;DR — the scope boundary that actually holds on this kind of box:**
 
 | Layer | Right tool | Headless via this MCP? |
