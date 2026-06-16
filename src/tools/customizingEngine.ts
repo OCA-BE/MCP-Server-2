@@ -26,6 +26,7 @@ import {
 import { getWriterSource, WRITER_REPORT_NAME, WRITER_REPORT_URL } from "../abap/zmcp_cust_write"
 import { resolveMaint, runSql, tableRows, col } from "./customizing"
 import { rememberTransport, buildTransportPrompt } from "./transportGovernance"
+import { getCapabilities, requireCaps, type PingResponse } from "./capabilities"
 
 // ─── Raw HTTP helper ───────────────────────────────────────────────────────────
 // The engine is reached via its SICF node, not an ADT endpoint, so we use the
@@ -207,6 +208,10 @@ async function callEngine(
     throw new Error(`Engine returned non-JSON (HTTP ${resp.status || "?"}): ${raw.substring(0, 500)}`)
   }
 }
+
+/** Engine ping for capability probing (see capabilities.ts). */
+const pingEngine = (connectionId?: string): Promise<PingResponse> =>
+  callEngine(connectionId, { operation: "ping" }) as Promise<PingResponse>
 
 // ─── IMG search-index read (STREE/SHI HSRCH cluster) ─────────────────────────────
 // Calls the engine's img_index_read op for one IMG structure. The engine IMPORTs
@@ -550,6 +555,15 @@ export async function handleOrgCopy(args: {
     } catch (err) {
       log("WARN", "auto-deploy of engine class failed", err)
     }
+  }
+
+  // Target-aware pre-flight: the EC entity copier isn't on every box (e.g. CAR
+  // has no ECOP). Refuse cleanly here instead of calling the engine and failing.
+  const caps = await getCapabilities(args.connectionId, pingEngine)
+  const capErr = requireCaps(caps, ["hasOrgCopy"],
+    { hasOrgCopy: "the EC entity copier (ECOP_ORG_UNITS_IN_THE_DARK)" })
+  if (capErr) {
+    return { content: [{ type: "text" as const, text: `❌ org_copy ${capErr}.` }] }
   }
 
   // Governed transport selection (shared interactive flow). The entity copier
