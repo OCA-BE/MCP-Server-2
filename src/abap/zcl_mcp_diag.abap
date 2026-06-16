@@ -11,7 +11,7 @@ CLASS zcl_mcp_diag DEFINITION
 
   PUBLIC SECTION.
     INTERFACES if_http_extension.
-    CONSTANTS c_version TYPE string VALUE 'diag-0.9.18'.
+    CONSTANTS c_version TYPE string VALUE 'diag-0.9.19'.
 
   PRIVATE SECTION.
     TYPES: BEGIN OF ty_request,
@@ -383,6 +383,67 @@ CLASS zcl_mcp_diag IMPLEMENTATION.
                  `FROM SYS.M_INIFILE_CONTENTS WHERE FILE_NAME = 'global.ini' ` &&
                  `AND SECTION = 'memorymanager' AND KEY = 'global_allocation_limit'`
       CHANGING ct_lines = lt_lines ).
+
+    " ── CPU + server topology (DB vs AS, co-residency) ────────────────────────
+    " The memory invariant only bites because DB and AS share a host; the CPU
+    " picture matters the same way. Report the app servers, the host CPU count +
+    " current load, HANA's own CPU share, and whether DB & AS are co-resident.
+    DATA: lt_srv    TYPE STANDARD TABLE OF msxxlist,
+          lv_ashost TYPE string,
+          lv_dbhost TYPE string,
+          lt_h      TYPE TABLE OF string,
+          lv_coloc  TYPE abap_bool.
+    CALL FUNCTION 'TH_SERVER_LIST'
+      TABLES     list   = lt_srv
+      EXCEPTIONS OTHERS = 1.
+    IF sy-subrc = 0.
+      LOOP AT lt_srv INTO DATA(ls_srv).
+        APPEND |AS inst={ ls_srv-name } host={ ls_srv-host }| TO lt_lines.
+      ENDLOOP.
+      APPEND |AS app_server_count={ lines( lt_srv ) }| TO lt_lines.
+    ENDIF.
+    lv_ashost = sy-host.
+
+    " logical CPUs of the host (the pool HANA + AS contend for)
+    run_hana_sql(
+      EXPORTING iv_tag = 'CPUINFO'
+        iv_sql = `SELECT KEY || '=' || VALUE FROM SYS.M_HOST_INFORMATION ` &&
+                 `WHERE KEY IN ('logical_cpu_count','cpu_threads','cpu_cores','machine_model')`
+      CHANGING ct_lines = lt_lines ).
+
+    " most-recent host CPU utilization % (whole box) from the load history
+    run_hana_sql(
+      EXPORTING iv_tag = 'CPU'
+        iv_sql = `SELECT TOP 1 'host_cpu_pct=' || CPU FROM SYS.M_LOAD_HISTORY_HOST ORDER BY TIME DESC`
+      CHANGING ct_lines = lt_lines ).
+
+    " HANA's own current CPU% (sum across services) — vs host total = the split
+    run_hana_sql(
+      EXPORTING iv_tag = 'CPU'
+        iv_sql = `SELECT 'hana_cpu_pct=' || TO_DECIMAL(SUM(PROCESS_CPU),10,1) FROM SYS.M_SERVICE_STATISTICS`
+      CHANGING ct_lines = lt_lines ).
+
+    " DB host (to compare with the AS host for co-residency)
+    TRY.
+        DATA(lo_h) = NEW cl_sql_statement( )->execute_query( `SELECT HOST FROM SYS.M_DATABASE` ).
+        lo_h->set_param_table( REF #( lt_h ) ).
+        lo_h->next_package( ).
+        lo_h->close( ).
+        READ TABLE lt_h INTO lv_dbhost INDEX 1.
+      CATCH cx_sql_exception.
+    ENDTRY.
+    IF lv_dbhost IS NOT INITIAL.
+      lv_coloc = boolc( to_upper( lv_dbhost ) CS to_upper( lv_ashost )
+                     OR to_upper( lv_ashost ) CS to_upper( lv_dbhost ) ).
+      APPEND |TOPO db_host={ lv_dbhost } as_host={ lv_ashost } co_resident={ lv_coloc }| TO lt_lines.
+      IF lv_coloc = abap_true.
+        APPEND `TOPO note: single-box appliance — HANA DB and the ABAP app server share the same CPUs and RAM. ` &&
+               `Under load they contend: HANA can saturate CPU/caches and starve dialog/batch WPs, and a busy AS steals CPU from HANA. ` &&
+               `Compare host_cpu_pct (whole box) with hana_cpu_pct (HANA's share) — the remainder is AS + OS. ` &&
+               `Keep HANA global_allocation_limit + AS working memory + OS under physical RAM (the memory invariant) and leave CPU headroom for both.`
+          TO lt_lines.
+      ENDIF.
+    ENDIF.
 
     rs_resp-rows_planned = lines( lt_lines ).
     /ui2/cl_json=>serialize(
