@@ -185,17 +185,23 @@ FORM run_listing
   USING    is_params TYPE ty_params
   CHANGING cs_result TYPE ty_result.
 
-  DATA: lr_all   TYPE REF TO data,
-        lr_sub   TYPE REF TO data,
-        lt_prods TYPE STANDARD TABLE OF matnr,
-        lv_prod  TYPE matnr,
-        lv_total TYPE i,
-        lv_done  TYPE i,
-        lv_err   TYPE i.
+  DATA: lr_all    TYPE REF TO data,
+        lr_sub    TYPE REF TO data,
+        lt_prods  TYPE STANDARD TABLE OF matnr,
+        lr_prod   TYPE RANGE OF matnr,
+        lv_prod   TYPE matnr,
+        lv_total  TYPE i,
+        lv_fmfail TYPE i,
+        lv_before TYPE i,
+        lv_after  TYPE i,
+        lv_delta  TYPE i,
+        lv_tstart TYPE sy-uzeit.
   FIELD-SYMBOLS: <all>  TYPE STANDARD TABLE,
                  <sub>  TYPE STANDARD TABLE,
                  <line> TYPE any,
                  <pf>   TYPE any.
+
+  lv_tstart = sy-uzeit.
 
   TRY.
       CREATE DATA lr_all TYPE ('WINT_LISTING_ITEM_TAB').
@@ -236,6 +242,12 @@ FORM run_listing
     IF sy-subrc = 0. APPEND <pf> TO lt_prods. ENDIF.
   ENDLOOP.
   SORT lt_prods. DELETE ADJACENT DUPLICATES FROM lt_prods.
+  lr_prod = VALUE #( FOR p IN lt_prods ( sign = 'I' option = 'EQ' low = p ) ).
+
+  " Truthful outcome: count the listing conditions (WLK1) BEFORE, so we can report
+  " how many were actually written — the FM returns subrc 0 even when every item is
+  " rejected (it logs the reason to the application log instead of failing).
+  SELECT COUNT(*) FROM wlk1 INTO @lv_before WHERE artnr IN @lr_prod.
 
   LOOP AT lt_prods INTO lv_prod.
     CLEAR <sub>.
@@ -259,22 +271,123 @@ FORM run_listing
         fatal_error              = 1
         OTHERS                   = 2.
     IF sy-subrc <> 0.
-      lv_err = lv_err + 1.
-      APPEND |Article { lv_prod ALPHA = OUT }: listing fatal_error (subrc { sy-subrc })|
+      lv_fmfail = lv_fmfail + 1.
+      APPEND |Article { lv_prod ALPHA = OUT }: listing FM fatal_error (subrc { sy-subrc })|
         TO cs_result-messages.
-      CONTINUE.   " keep processing the remaining articles
     ENDIF.
-    lv_done = lv_done + lines( <sub> ).
-    APPEND |Article { lv_prod ALPHA = OUT }: { lines( <sub> ) } assortment(s) listed|
-      TO cs_result-messages.
   ENDLOOP.
 
   COMMIT WORK AND WAIT.
-  cs_result-status       = COND #( WHEN lv_done > 0 THEN 'ok' ELSE 'error' ).
-  cs_result-rows_written = lv_done.
-  APPEND |Listed { lv_done } of { lv_total } article/assortment item(s) across { lines( lt_prods ) } | &&
-         |article(s) in batch (sy-batch='{ sy-batch }'); { lv_err } article(s) errored — segments + WLK1 written|
+
+  SELECT COUNT(*) FROM wlk1 INTO @lv_after WHERE artnr IN @lr_prod.
+  lv_delta = lv_after - lv_before.
+
+  " Surface the per-item messages the listing engine wrote to its application log
+  " (object 'W' / subobject 'W_LISTERR') during this run — e.g. WM 006 "enter
+  " listing procedure", WM 057 invalid assortment — so a rejection is never hidden
+  " behind a clean FM return.
+  PERFORM read_listing_log USING lv_tstart CHANGING cs_result.
+
+  cs_result-rows_written = lv_delta.
+  cs_result-status       = COND #( WHEN lv_delta > 0 THEN 'ok' ELSE 'error' ).
+  APPEND |Listing FM ran for { lines( lt_prods ) } article(s) in batch (sy-batch='{ sy-batch }'); | &&
+         |{ lv_delta } WLK1 listing condition(s) written| &&
+         COND string( WHEN lv_fmfail > 0 THEN |; { lv_fmfail } article(s) hit a fatal FM error| ELSE `` ) &&
+         COND string( WHEN lv_delta = 0 THEN ` — NOTHING listed; see listing-log messages above` ELSE `` )
     TO cs_result-messages.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*&  Read the listing application log (object 'W' / subobject 'W_LISTERR')
+*&  written by EXECUTE_LISTING_ART_ASSORT_RFC during this run, and surface
+*&  the error/abort/warning messages — so a rejection (e.g. WM 006 "enter
+*&  listing procedure", WM 057 invalid assortment) is never hidden behind
+*&  the FM's clean subrc-0 return. Scoped by user + today + this run's start
+*&  time. BAL FMs are basis (present on every box).
+*&---------------------------------------------------------------------*
+FORM read_listing_log
+  USING    iv_tstart TYPE sy-uzeit
+  CHANGING cs_result TYPE ty_result.
+
+  DATA: ls_fil   TYPE bal_s_lfil,
+        lt_hdr    TYPE balhdr_t,
+        lt_msgh  TYPE bal_t_msgh,
+        ls_msg   TYPE bal_s_msg,
+        lv_txt   TYPE string,
+        lv_key   TYPE string,
+        lt_seen  TYPE SORTED TABLE OF string WITH UNIQUE KEY table_line,
+        lv_shown TYPE i,
+        lv_errs  TYPE i.
+
+  ls_fil-object    = VALUE #( ( sign = 'I' option = 'EQ' low = 'W' ) ).
+  ls_fil-subobject = VALUE #( ( sign = 'I' option = 'EQ' low = 'W_LISTERR' ) ).
+  ls_fil-aluser    = VALUE #( ( sign = 'I' option = 'EQ' low = sy-uname ) ).
+  ls_fil-aldate    = VALUE #( ( sign = 'I' option = 'EQ' low = sy-datum ) ).
+  ls_fil-altime    = VALUE #( ( sign = 'I' option = 'BT' low = iv_tstart high = '235959' ) ).
+
+  CALL FUNCTION 'BAL_DB_SEARCH'
+    EXPORTING  i_s_log_filter = ls_fil
+    IMPORTING  e_t_log_header = lt_hdr
+    EXCEPTIONS log_not_found  = 1
+               OTHERS         = 2.
+  IF sy-subrc <> 0 OR lt_hdr IS INITIAL.
+    RETURN.   " no listing log for this run
+  ENDIF.
+
+  CALL FUNCTION 'BAL_DB_LOAD'
+    EXPORTING  i_t_log_header    = lt_hdr
+    EXCEPTIONS no_logs_specified = 1
+               log_not_found     = 2
+               OTHERS            = 3.
+  IF sy-subrc <> 0.
+    RETURN.
+  ENDIF.
+
+  CALL FUNCTION 'BAL_GLB_SEARCH_MSG'
+    IMPORTING  e_t_msg_handle = lt_msgh
+    EXCEPTIONS msg_not_found  = 1
+               OTHERS         = 2.
+  IF sy-subrc <> 0.
+    RETURN.
+  ENDIF.
+
+  LOOP AT lt_msgh INTO DATA(ls_msgh).
+    CALL FUNCTION 'BAL_LOG_MSG_READ'
+      EXPORTING  i_s_msg_handle = ls_msgh
+      IMPORTING  e_s_msg        = ls_msg
+      EXCEPTIONS OTHERS         = 1.
+    IF sy-subrc <> 0.
+      CONTINUE.
+    ENDIF.
+    IF ls_msg-msgty NA 'EAWX'.   " surface problems only; skip success/info
+      CONTINUE.
+    ENDIF.
+    IF ls_msg-msgty CA 'EA'.
+      lv_errs = lv_errs + 1.
+    ENDIF.
+    lv_key = |{ ls_msg-msgid }{ ls_msg-msgno }{ ls_msg-msgv1 }{ ls_msg-msgv2 }|.
+    READ TABLE lt_seen TRANSPORTING NO FIELDS WITH KEY table_line = lv_key.
+    IF sy-subrc = 0.
+      CONTINUE.   " de-dupe identical per-item messages
+    ENDIF.
+    INSERT lv_key INTO TABLE lt_seen.
+    IF lv_shown < 25.
+      CLEAR lv_txt.
+      MESSAGE ID ls_msg-msgid TYPE 'I' NUMBER ls_msg-msgno
+        WITH ls_msg-msgv1 ls_msg-msgv2 ls_msg-msgv3 ls_msg-msgv4 INTO lv_txt.
+      APPEND |listing-log { ls_msg-msgty } { ls_msg-msgid }{ ls_msg-msgno }: { lv_txt }|
+        TO cs_result-messages.
+      lv_shown = lv_shown + 1.
+    ENDIF.
+  ENDLOOP.
+
+  IF lv_shown >= 25.
+    APPEND `…(more listing-log messages truncated)` TO cs_result-messages.
+  ENDIF.
+  IF lv_errs > 0.
+    APPEND |{ lv_errs } distinct error/abort message(s) in the listing log — listing rejected for those items|
+      TO cs_result-messages.
+  ENDIF.
 ENDFORM.
 
 *&---------------------------------------------------------------------*
