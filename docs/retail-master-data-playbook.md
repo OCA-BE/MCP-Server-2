@@ -67,10 +67,17 @@ sales-org view in the assortment's `VKORG` context) and forced a re-load. Load e
    - **Material number must be the canonical form.** Use `CONVERSION_EXIT_MATN1_INPUT` (→
      `000000000000000156`), not plain `ALPHA` on the 40-char field (→ 38 zeros+156), or `get_product_data`'s
      `SELECT … WHERE matnr = iv_product` finds nothing → `WM 028`.
-   - **Articles need a listing procedure.** `MVKE-LSTFL` (store) / `MVKE-LSTVZ` (DC) must be set
-     (`TWLV`; `01` = standard default). Blank → `check_listing_rules` fails with `WM 006` ("enter
-     listing procedure") and the article is **silently disallowed** (FM completes, **0** WLK1
-     written). So `S_MVKE` must carry `LSTFL`/`LSTVZ` — the template ships `01` for this reason.
+   - **Articles need a listing procedure — and the right one.** `MVKE-LSTFL` (store) / `MVKE-LSTVZ`
+     (DC) must be set (`TWLV`). Blank → `check_listing_rules` fails with `WM 006` ("enter listing
+     procedure"), article **silently disallowed** (FM completes, **0** WLK1). But the standard
+     default `01` runs a *classification* check (profile **P** + class **K**) and fails with `WM 589`
+     ("product group … not defined in assortment") unless the article's merchandise categories are
+     linked to the assortment. For demo listing without that MC-assortment setup, use a **list-all
+     procedure — `02`** (`TWLV` `LIST_ALL=X`, no profile/classification), which lists into exactly
+     the assortments you pass. The template ships `LSTFL`/`LSTVZ` = `02` for this reason.
+   - **The `retail_listing` tool reports the truth (v0.9.21):** it counts the WLK1 delta and reads
+     the listing application log (`W`/`W_LISTERR`), so a rejection surfaces as `status=error,
+     rows=0` + the actual `WM 006`/`WM 589`/… message — never a false "N listed".
 
 ---
 
