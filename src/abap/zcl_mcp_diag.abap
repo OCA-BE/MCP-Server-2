@@ -11,7 +11,7 @@ CLASS zcl_mcp_diag DEFINITION
 
   PUBLIC SECTION.
     INTERFACES if_http_extension.
-    CONSTANTS c_version TYPE string VALUE 'diag-0.9.17'.
+    CONSTANTS c_version TYPE string VALUE 'diag-0.9.18'.
 
   PRIVATE SECTION.
     TYPES: BEGIN OF ty_request,
@@ -215,8 +215,11 @@ CLASS zcl_mcp_diag IMPLEMENTATION.
       ( `abap/buffersize` ) ( `zcsa/table_buffer_area` ) ( `zcsa/db_max_buftab` )
       ( `rsdb/ntab/ftabsize` ) ( `rsdb/ntab/entrycount` )
       ( `rdisp/wp_no_dia` ) ( `rdisp/wp_no_btc` ) ( `rdisp/wp_no_upd` )
-      ( `rdisp/wp_no_enq` ) ( `rdisp/wp_no_spo` ) ( `rdisp/wp_max_no` )
-      ( `rdisp/max_wprun_time` ) ( `ztta/max_memreq_MB` ) ).
+      ( `rdisp/wp_no_vb2` ) ( `rdisp/wp_no_enq` ) ( `rdisp/wp_no_spo` )
+      ( `rdisp/wp_max_no` ) ( `rdisp/wp_no_restricted` )
+      ( `rdisp/configurable_wp_no` ) ( `rdisp/dynamic_wp_check` )
+      ( `rdisp/max_wprun_time` ) ( `rdisp/scheduler/max_wprun_time` )
+      ( `ztta/max_memreq_MB` ) ).
 
     LOOP AT lt_names INTO DATA(lv_n).
       lv_name = lv_n.
@@ -256,6 +259,38 @@ CLASS zcl_mcp_diag IMPLEMENTATION.
     ELSE.
       APPEND VALUE #( name = 'usage:NOTE'
                       value = |SAPTUNE_GET_SUMMARY_STATISTIC unavailable (subrc { sy-subrc })| ) TO lt_p.
+    ENDIF.
+
+    " ── Live work-process inventory of the local app server (TH_WPINFO) ───────
+    " Profile rdisp/wp_no_* are the CONFIGURED counts; with dynamic WPs / op
+    " modes the RUNNING set can differ. Report the actual per-type counts so the
+    " sizing recommendation reflects reality. TH_WPINFO is a kernel FM (portable).
+    DATA: lt_wp TYPE STANDARD TABLE OF wpinfo.
+    TYPES: BEGIN OF ty_wpc,
+             typ TYPE wptyp,
+             cnt TYPE i,
+           END OF ty_wpc.
+    DATA: lt_wpc TYPE SORTED TABLE OF ty_wpc WITH UNIQUE KEY typ,
+          ls_wpc TYPE ty_wpc.
+    CALL FUNCTION 'TH_WPINFO'
+      TABLES
+        wplist = lt_wp
+      EXCEPTIONS
+        OTHERS = 1.
+    IF sy-subrc = 0.
+      LOOP AT lt_wp INTO DATA(ls_wp).
+        " count by the raw kernel WP type code (faithful, no fixed list)
+        ls_wpc-typ = ls_wp-wp_typ.
+        ls_wpc-cnt = 1.
+        COLLECT ls_wpc INTO lt_wpc.
+      ENDLOOP.
+      LOOP AT lt_wpc INTO ls_wpc.
+        APPEND VALUE #( name = |wp_live:{ ls_wpc-typ }| value = |{ ls_wpc-cnt }| ) TO lt_p.
+      ENDLOOP.
+      APPEND VALUE #( name = 'wp_live:TOTAL' value = |{ lines( lt_wp ) }| ) TO lt_p.
+    ELSE.
+      APPEND VALUE #( name = 'wp_live:NOTE'
+                      value = |TH_WPINFO unavailable (subrc { sy-subrc })| ) TO lt_p.
     ENDIF.
 
     rs_resp-status = 'ok'.
