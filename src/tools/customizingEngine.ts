@@ -33,7 +33,7 @@ import { rememberTransport, buildTransportPrompt } from "./transportGovernance"
 
 // Keys are lowercase — /ui2/cl_json deserialize maps case-insensitively.
 interface EngineRequest {
-  operation: "ping" | "read" | "write" | "create" | "delete" | "selftest" | "status" | "img_index_read" | "hana_memory" | "org_copy"
+  operation: "ping" | "read" | "write" | "create" | "listing" | "delete" | "selftest" | "status" | "img_index_read" | "hana_memory" | "org_copy"
   table?: string
   key_field?: string
   source_key?: string
@@ -56,6 +56,7 @@ interface EngineRequest {
   org_unit?: string           // org_copy: org-key DOMAIN name (BUKRS, WERKS, VKORG, VTWEG, SPART, EKORG, …)
   values_json?: string        // write: JSON array of {FIELD,VALUE} overrides applied to every planned row
   rows_json?: string          // create: JSON array of rows, each a JSON array of {FIELD,VALUE} (full key + data)
+  items_json?: string         // listing: JSON array of {PRODUCT,ASSORTMENT,DATE_FROM,DATE_TO}
 }
 
 // ─── transport selection (governed workflow) ─────────────────────────────────
@@ -985,6 +986,68 @@ export async function handleCustomizingCreate(args: {
   return { content: [{ type: "text" as const, text: lines.join("\n") }] }
 }
 
+// ─── retail_listing ───────────────────────────────────────────────────────────
+// List articles into assortments via SAP's listing engine
+// (EXECUTE_LISTING_ART_ASSORT_RFC, determine_data=X). Extends each article to
+// the assortment's assigned sites (MARC/valuation segments) and writes the
+// WLK1 listing conditions. DRY RUN by default (returns the prepared items).
+export async function handleRetailListing(args: {
+  items: { product: string; assortment: string; dateFrom?: string; dateTo?: string }[]
+  commit?: boolean
+  autoDeploy?: boolean
+  icfPath?: string
+  connectionId?: string
+}) {
+  const commit = args.commit === true
+  if (!Array.isArray(args.items) || args.items.length === 0) {
+    return { content: [{ type: "text" as const, text:
+      `❌ items is required: a non-empty array of { product, assortment } (optionally dateFrom/dateTo as YYYYMMDD).` }] }
+  }
+  let deployNote = ""
+  if (args.autoDeploy !== false) {
+    try {
+      const d = await ensureEngineClass(args.connectionId)
+      if (d.changed) deployNote = `(engine ${d.action} to v${ENGINE_VERSION})\n`
+    } catch (err) { log("WARN", "auto-deploy of engine class failed", err) }
+  }
+  const itemsJson = JSON.stringify(args.items.map(i => ({
+    PRODUCT: i.product, ASSORTMENT: i.assortment,
+    DATE_FROM: i.dateFrom ?? "", DATE_TO: i.dateTo ?? "",
+  })))
+  const body: EngineRequest = {
+    operation: "listing",
+    items_json: itemsJson,
+    commit: commit ? "X" : "",
+  }
+  let r: EngineResponse
+  try {
+    r = await callEngine(args.connectionId, body, args.icfPath)
+  } catch (err) {
+    return { content: [{ type: "text" as const, text:
+      `❌ Engine call failed: ${String((err as Error).message ?? err)}\nRun customizing_engine_ping to diagnose.` }] }
+  }
+  const isDry = r.DRY_RUN === "X" || !commit
+  const lines: string[] = [
+    ...(deployNote ? [deployNote.trimEnd()] : []),
+    isDry ? `📋 DRY RUN — nothing listed` : `✏️  LISTING`,
+    `   Status:   ${r.STATUS}`,
+    `   Items:    ${args.items.length}`,
+    `   Planned:  ${r.ROWS_PLANNED ?? 0}`,
+    ...(commit ? [`   Listed:   ${r.ROWS_WRITTEN ?? 0}`] : []),
+    ...(r.MESSAGES?.length ? ["", "   Messages:", ...r.MESSAGES.map(m => `     • ${m}`)] : []),
+  ]
+  if (isDry && r.DATA_JSON) {
+    try {
+      const rows = JSON.parse(r.DATA_JSON)
+      lines.push("", `   Prepared items (${Array.isArray(rows) ? rows.length : 0}):`)
+      lines.push("   " + JSON.stringify(rows, null, 2).split("\n").join("\n   "))
+    } catch { /* leave raw out if unparseable */ }
+    lines.push("", `   To execute: re-run with commit: true`)
+  }
+  if (r.STATUS === "error") log("WARN", `retail_listing error`, r.MESSAGES)
+  return { content: [{ type: "text" as const, text: lines.join("\n") }] }
+}
+
 // ─── customizing_status ─────────────────────────────────────────────────────────
 // Poll the result of an async write (customizing_apply commit) by its run_id.
 
@@ -1262,6 +1325,34 @@ export function registerCustomizingEngineTools(server: McpServer): void {
       }
     },
     handleCustomizingCreate
+  )
+
+  server.registerTool(
+    "retail_listing",
+    {
+      title: "List Articles into Assortments (Retail)",
+      description:
+        "List one or more articles into retail assortments via SAP's standard listing engine " +
+        "(EXECUTE_LISTING_ART_ASSORT_RFC, determine_data=X). Listing EXTENDS each article to the " +
+        "assortment's assigned sites (creating the plant/valuation segments) and writes the WLK1 " +
+        "listing conditions, so the article becomes available at those sites. Listing into a " +
+        "GENERAL assortment propagates to all its assigned sites (incl. their local assortments).\n\n" +
+        "DRY RUN by default — returns the prepared listing items. Set commit: true to execute. " +
+        "dateFrom/dateTo default to today / 9999-12-31. Material numbers are ALPHA-padded automatically.",
+      inputSchema: {
+        items: z.array(z.object({
+          product:    z.string().describe("Article/material number (e.g. 000000000000000151 or 151 — ALPHA-padded automatically)"),
+          assortment: z.string().describe("Assortment to list into (e.g. BE_STD, or a site's local assortment)"),
+          dateFrom:   z.string().optional().describe("Validity start YYYYMMDD (default: today)"),
+          dateTo:     z.string().optional().describe("Validity end YYYYMMDD (default: 99991231)"),
+        })).describe("Article→assortment listing items, e.g. [{ product: \"151\", assortment: \"BE_STD\" }]."),
+        commit:       z.boolean().optional().describe("Actually list (default: false = dry run returning the prepared items)"),
+        autoDeploy:   z.boolean().optional().describe("Auto-deploy/update the engine class if missing or outdated (default: true)"),
+        icfPath:      z.string().optional().describe(`SICF path of the engine (default: ${ENGINE_ICF_PATH})`),
+        connectionId: z.string().optional().describe("SAP system connection ID"),
+      }
+    },
+    handleRetailListing
   )
 
   server.registerTool(

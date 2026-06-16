@@ -34,6 +34,7 @@ CLASS zcl_mcp_cust_engine DEFINITION
              org_unit         TYPE string,     " org_copy: org-key DOMAIN (BUKRS, WERKS, VKORG, VTWEG, SPART, EKORG, …)
              values_json      TYPE string,     " write: JSON array of {FIELD,VALUE} overrides applied to every planned row
              rows_json        TYPE string,     " create: JSON array of rows, each row a JSON array of {FIELD,VALUE} (full key + data)
+             items_json       TYPE string,     " listing: JSON array of {PRODUCT,ASSORTMENT,DATE_FROM,DATE_TO} listing items
            END OF ty_request.
 
     " Field override for handle_write: applied to each planned row after the
@@ -144,6 +145,13 @@ CLASS zcl_mcp_cust_engine DEFINITION
       IMPORTING iv_table     TYPE string
                 ir_row       TYPE REF TO data
       RETURNING VALUE(rv_ok) TYPE abap_bool.
+
+    "! Retail listing: list articles into assortments via SAP's listing engine
+    "! (EXECUTE_LISTING_ART_ASSORT_RFC, determine_data=X so the articles are
+    "! extended to the assortment's assigned sites + WLK1 conditions written).
+    METHODS handle_listing
+      IMPORTING is_req         TYPE ty_request
+      RETURNING VALUE(rs_resp) TYPE ty_response.
 
     METHODS handle_delete
       IMPORTING is_req         TYPE ty_request
@@ -323,6 +331,7 @@ CLASS zcl_mcp_cust_engine IMPLEMENTATION.
             WHEN 'read'.     ls_resp = handle_read( ls_req ).
             WHEN 'write'.    ls_resp = handle_write( ls_req ).
             WHEN 'create'.   ls_resp = handle_create( ls_req ).
+            WHEN 'listing'.  ls_resp = handle_listing( ls_req ).
             WHEN 'delete'.   ls_resp = handle_delete( ls_req ).
             WHEN 'selftest'. ls_resp = handle_selftest( ls_req ).
             WHEN 'status'.   ls_resp = handle_status( ls_req ).
@@ -534,12 +543,12 @@ CLASS zcl_mcp_cust_engine IMPLEMENTATION.
     rs_resp-operation = 'org_copy'.
     rs_resp-version   = c_version.
 
-    DATA: lv_org_unit TYPE entcopy00-domname,
+    " ECOP types resolved dynamically so the class compiles on non-ECOP systems
+    " (e.g. CAR); the FM-existence guard below returns cleanly there.
+    DATA: lv_org_unit TYPE domname,
           lv_action   TYPE c LENGTH 4,
           lv_source   TYPE c LENGTH 30,
-          lv_target   TYPE c LENGTH 30,
-          lt_tablist  TYPE ecopt_tdd02l,
-          ls_tabline  TYPE ecopt_dd02l.
+          lv_target   TYPE c LENGTH 30.
 
     lv_org_unit = to_upper( is_req-org_unit ).
     lv_action   = COND #( WHEN to_upper( is_req-action ) = 'DELE'
@@ -569,16 +578,30 @@ CLASS zcl_mcp_cust_engine IMPLEMENTATION.
       RETURN.
     ENDIF.
 
-    " ── Dry run: resolve the org unit, report its dependent-table set ───────
+    " ── Dry run: validate the org unit + report its description ─────────────
+    " (The dependent-table enumeration used ECOP-only structures; resolving the
+    " org unit dynamically keeps this portable. The exact table count is still
+    " reported on the actual commit.)
     IF is_req-commit = abap_false.
-      DATA ls_orgunit TYPE ecop_orgunit.
-      FIELD-SYMBOLS <lt_tabs> TYPE ecop_tables_tab.
+      DATA: lr_orgunit TYPE REF TO data,
+            lv_desc    TYPE string.
+      FIELD-SYMBOLS: <orgunit> TYPE any,
+                     <desc>    TYPE any.
+      TRY.
+          CREATE DATA lr_orgunit TYPE ('ECOP_ORGUNIT').
+          ASSIGN lr_orgunit->* TO <orgunit>.
+        CATCH cx_root INTO DATA(lx_eco).
+          rs_resp-status = 'error'.
+          APPEND |ECOP entity-copier types not available on this system: { lx_eco->get_text( ) }|
+            TO rs_resp-messages.
+          RETURN.
+      ENDTRY.
       CALL FUNCTION 'ECOP_GET_TABLES_TO_ORGUNIT'
         EXPORTING
           pv_org_unit       = lv_org_unit
           pv_flag_no_dialog = 'X'
         CHANGING
-          ps_orgunit        = ls_orgunit
+          ps_orgunit        = <orgunit>
         EXCEPTIONS
           invalid_org_unit     = 1
           no_tables_to_orgunit = 2
@@ -589,24 +612,14 @@ CLASS zcl_mcp_cust_engine IMPLEMENTATION.
           TO rs_resp-messages.
         RETURN.
       ENDIF.
-      IF ls_orgunit-tables IS BOUND.
-        ASSIGN ls_orgunit-tables->* TO <lt_tabs>.
-        LOOP AT <lt_tabs> ASSIGNING FIELD-SYMBOL(<ls_tab>).
-          CLEAR ls_tabline.
-          MOVE-CORRESPONDING <ls_tab> TO ls_tabline.
-          ls_tabline-text = <ls_tab>-ddtext.
-          APPEND ls_tabline TO lt_tablist.
-        ENDLOOP.
+      ASSIGN COMPONENT 'DESCRIPTION' OF STRUCTURE <orgunit> TO <desc>.
+      IF sy-subrc = 0.
+        lv_desc = <desc>.
       ENDIF.
-      rs_resp-status       = 'ok'.
-      rs_resp-rows_planned = lines( lt_tablist ).
-      APPEND |DRY RUN — { lv_action } '{ ls_orgunit-description }' ({ lv_org_unit }) { lv_source } → { lv_target }: | &&
-             |{ lines( lt_tablist ) } dependent tables in scope|
+      rs_resp-status = 'ok'.
+      APPEND |DRY RUN — { lv_action } '{ lv_desc }' ({ lv_org_unit }): { lv_source } → { lv_target } | &&
+             |— commit to copy the org unit with its dependent customizing|
         TO rs_resp-messages.
-      /ui2/cl_json=>serialize(
-        EXPORTING data        = lt_tablist
-                  pretty_name = /ui2/cl_json=>pretty_mode-none
-        RECEIVING r_json      = rs_resp-data_json ).
       RETURN.
     ENDIF.
 
@@ -1268,6 +1281,119 @@ CLASS zcl_mcp_cust_engine IMPLEMENTATION.
 
     SELECT COUNT(*) FROM (lv_tab) INTO lv_cnt WHERE (lv_where).
     rv_ok = COND #( WHEN lv_cnt > 0 THEN abap_true ELSE abap_false ).
+  ENDMETHOD.
+
+
+  METHOD handle_listing.
+    " List articles into assortments via SAP's listing engine. items_json =
+    " JSON array of {PRODUCT,ASSORTMENT,DATE_FROM,DATE_TO}. determine_data='X'
+    " extends each article to the assortment's assigned sites + writes WLK1.
+    " Retail-only type (WINT_LISTING_ITEM_TAB) and the FM are resolved
+    " DYNAMICALLY, so this class still activates on non-retail systems (e.g. CAR);
+    " fm_exists guards the actual call there. No static retail-type references.
+    TYPES: BEGIN OF ty_item_in,
+             product    TYPE c LENGTH 40,
+             assortment TYPE c LENGTH 10,
+             date_from  TYPE c LENGTH 8,
+             date_to    TYPE c LENGTH 8,
+           END OF ty_item_in.
+    DATA: lt_in    TYPE STANDARD TABLE OF ty_item_in WITH DEFAULT KEY,
+          lr_items TYPE REF TO data,
+          lr_line  TYPE REF TO data.
+    FIELD-SYMBOLS: <items> TYPE STANDARD TABLE,
+                   <line>  TYPE any,
+                   <fld>   TYPE any.
+
+    rs_resp-operation = 'listing'.
+    rs_resp-dry_run   = COND #( WHEN is_req-commit = abap_true THEN abap_false ELSE abap_true ).
+
+    IF fm_exists( 'EXECUTE_LISTING_ART_ASSORT_RFC' ) = abap_false.
+      rs_resp-status = 'error'.
+      APPEND 'Listing engine FM EXECUTE_LISTING_ART_ASSORT_RFC not installed on this box (not an IS-Retail system)'
+        TO rs_resp-messages.
+      RETURN.
+    ENDIF.
+    IF is_req-items_json IS INITIAL.
+      rs_resp-status = 'error'.
+      APPEND 'ITEMS_JSON is required (array of {PRODUCT,ASSORTMENT,DATE_FROM,DATE_TO})'
+        TO rs_resp-messages.
+      RETURN.
+    ENDIF.
+
+    TRY.
+        /ui2/cl_json=>deserialize(
+          EXPORTING json        = is_req-items_json
+                    pretty_name = /ui2/cl_json=>pretty_mode-none
+          CHANGING  data        = lt_in ).
+      CATCH cx_root INTO DATA(lx_ij).
+        rs_resp-status = 'error'.
+        APPEND |Cannot parse ITEMS_JSON: { lx_ij->get_text( ) }| TO rs_resp-messages.
+        RETURN.
+    ENDTRY.
+
+    TRY.
+        CREATE DATA lr_items TYPE ('WINT_LISTING_ITEM_TAB').
+        ASSIGN lr_items->* TO <items>.
+      CATCH cx_root INTO DATA(lx_ty).
+        rs_resp-status = 'error'.
+        APPEND |Listing item type WINT_LISTING_ITEM_TAB not available: { lx_ty->get_text( ) }| TO rs_resp-messages.
+        RETURN.
+    ENDTRY.
+
+    LOOP AT lt_in INTO DATA(ls_in).
+      CREATE DATA lr_line LIKE LINE OF <items>.
+      ASSIGN lr_line->* TO <line>.
+      CLEAR <line>.
+      ASSIGN COMPONENT 'PRODUCT' OF STRUCTURE <line> TO <fld>.
+      IF sy-subrc = 0. <fld> = |{ ls_in-product ALPHA = IN }|. ENDIF.
+      ASSIGN COMPONENT 'ASSORTMENT' OF STRUCTURE <line> TO <fld>.
+      IF sy-subrc = 0. <fld> = ls_in-assortment. ENDIF.
+      ASSIGN COMPONENT 'DATE_FROM' OF STRUCTURE <line> TO <fld>.
+      IF sy-subrc = 0. <fld> = COND #( WHEN ls_in-date_from IS INITIAL THEN sy-datum ELSE ls_in-date_from ). ENDIF.
+      ASSIGN COMPONENT 'DATE_TO' OF STRUCTURE <line> TO <fld>.
+      IF sy-subrc = 0. <fld> = COND #( WHEN ls_in-date_to IS INITIAL THEN '99991231' ELSE ls_in-date_to ). ENDIF.
+      ASSIGN COMPONENT 'LISTING_ALLOWED' OF STRUCTURE <line> TO <fld>.
+      IF sy-subrc = 0. <fld> = 'X'. ENDIF.
+      APPEND <line> TO <items>.
+    ENDLOOP.
+
+    rs_resp-rows_planned = lines( <items> ).
+
+    IF is_req-commit = abap_false.
+      rs_resp-status = 'ok'.
+      APPEND |DRY RUN — { rs_resp-rows_planned } listing item(s) prepared (set commit to execute)|
+        TO rs_resp-messages.
+      /ui2/cl_json=>serialize(
+        EXPORTING data        = <items>
+                  pretty_name = /ui2/cl_json=>pretty_mode-none
+        RECEIVING r_json      = rs_resp-data_json ).
+      RETURN.
+    ENDIF.
+
+    CALL FUNCTION 'EXECUTE_LISTING_ART_ASSORT_RFC'
+      EXPORTING
+        it_products_assort       = <items>
+        iv_product               = space
+        iv_all_assort            = space
+        iv_recheck               = 'X'
+        iv_determine_data        = 'X'
+        iv_selection_string      = space
+        iv_include_local_assorts = 'X'
+      EXCEPTIONS
+        fatal_error              = 1
+        OTHERS                   = 2.
+    IF sy-subrc <> 0.
+      ROLLBACK WORK.
+      rs_resp-status = 'error'.
+      APPEND |Listing engine raised fatal_error (subrc { sy-subrc })| TO rs_resp-messages.
+      RETURN.
+    ENDIF.
+
+    COMMIT WORK AND WAIT.
+    rs_resp-status       = 'ok'.
+    rs_resp-rows_written = rs_resp-rows_planned.
+    APPEND |Listed { rs_resp-rows_planned } article/assortment item(s) (segments determined + WLK1 written)|
+      TO rs_resp-messages.
   ENDMETHOD.
 
 

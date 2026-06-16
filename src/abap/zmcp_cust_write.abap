@@ -71,7 +71,9 @@ FORM run_org_copy
   USING    is_params TYPE ty_params
   CHANGING cs_result TYPE ty_result.
 
-  DATA: lv_org_unit TYPE entcopy00-domname,
+  " ECOP types resolved dynamically so this report compiles on non-ECOP systems
+  " (e.g. CAR); the ORGCOPY branch only ever runs on a box that has the copier.
+  DATA: lv_org_unit TYPE domname,
         lv_action   TYPE c LENGTH 4,
         lv_source   TYPE c LENGTH 30,
         lv_target   TYPE c LENGTH 30,
@@ -80,10 +82,20 @@ FORM run_org_copy
         lv_exp_task TYPE trkorr,
         lv_rc       TYPE sy-subrc,
         lv_descr    TYPE dd03p-scrtext_m,
-        lv_orgout   TYPE entcopy00-domname,
-        lt_tablist  TYPE ecopt_tdd02l,
+        lv_orgout   TYPE domname,
+        lr_tablist  TYPE REF TO data,
         lv_keys     TYPE i,
         lv_exc      TYPE string.
+  FIELD-SYMBOLS <tablist> TYPE ANY TABLE.
+
+  TRY.
+      CREATE DATA lr_tablist TYPE ('ECOPT_TDD02L').
+      ASSIGN lr_tablist->* TO <tablist>.
+    CATCH cx_root.
+      cs_result-status = 'error'.
+      APPEND 'ECOP entity-copier types not available on this system' TO cs_result-messages.
+      RETURN.
+  ENDTRY.
 
   lv_org_unit = to_upper( is_params-org_unit ).
   lv_action   = to_upper( is_params-action ).
@@ -105,7 +117,7 @@ FORM run_org_copy
       org_unit          = lv_orgout
       export_tr_request = lv_exp_req
       export_tr_task    = lv_exp_task
-      ev_tablist        = lt_tablist
+      ev_tablist        = <tablist>
     EXCEPTIONS
       no_valid_orgunit           = 1
       no_valid_action            = 2
@@ -152,7 +164,7 @@ FORM run_org_copy
   cs_result-e071k_count  = lv_keys.
   APPEND |{ lv_action } '{ lv_descr }' ({ lv_org_unit }): { lv_source } → { lv_target }|
     TO cs_result-messages.
-  APPEND |{ lines( lt_tablist ) } dependent tables processed by the entity copier (batch sy-batch='{ sy-batch }')|
+  APPEND |{ lines( <tablist> ) } dependent tables processed by the entity copier (batch sy-batch='{ sy-batch }')|
     TO cs_result-messages.
   APPEND |Transport { lv_exp_req } / task { lv_exp_task } — { lv_keys } object keys on the task|
     TO cs_result-messages.
