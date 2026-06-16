@@ -493,8 +493,38 @@ CLASS zcl_mcp_cust_engine IMPLEMENTATION.
       APPEND ls_p TO lt_p.
     ENDLOOP.
 
+    " ── Live usage (ST02 backend): EM / heap / roll / paging high-water ───────
+    " SAPTUNE_GET_SUMMARY_STATISTIC + its EMSTATUSAG/HPSTATUSAG/RLPG_STAT
+    " structures are basis (ST02), present on every ABAP box.
+    DATA: ls_em   TYPE emstatusag,
+          ls_hp   TYPE hpstatusag,
+          ls_roll TYPE rlpg_stat,
+          ls_page TYPE rlpg_stat.
+    CALL FUNCTION 'SAPTUNE_GET_SUMMARY_STATISTIC'
+      IMPORTING
+        roll_area             = ls_roll
+        paging_area           = ls_page
+        extended_memory_usage = ls_em
+        heap_memory_usage     = ls_hp
+      EXCEPTIONS
+        OTHERS                = 1.
+    IF sy-subrc = 0.
+      APPEND VALUE #( name = 'usage:EM_USED'      value = |{ ls_em-used }| )       TO lt_p.
+      APPEND VALUE #( name = 'usage:EM_ALLOCATED' value = |{ ls_em-allocated }| )  TO lt_p.
+      APPEND VALUE #( name = 'usage:EM_TOTAL'     value = |{ ls_em-total }| )      TO lt_p.
+      APPEND VALUE #( name = 'usage:HEAP_USED'    value = |{ ls_hp-used }| )       TO lt_p.
+      APPEND VALUE #( name = 'usage:HEAP_TOTAL'   value = |{ ls_hp-total }| )      TO lt_p.
+      APPEND VALUE #( name = 'usage:ROLL_MAXUSED' value = |{ ls_roll-max_used }| ) TO lt_p.
+      APPEND VALUE #( name = 'usage:ROLL_SIZE'    value = |{ ls_roll-area_size }| ) TO lt_p.
+      APPEND VALUE #( name = 'usage:PAGE_MAXUSED' value = |{ ls_page-max_used }| ) TO lt_p.
+      APPEND VALUE #( name = 'usage:PAGE_SIZE'    value = |{ ls_page-area_size }| ) TO lt_p.
+    ELSE.
+      APPEND VALUE #( name = 'usage:NOTE'
+                      value = |SAPTUNE_GET_SUMMARY_STATISTIC unavailable (subrc { sy-subrc })| ) TO lt_p.
+    ENDIF.
+
     rs_resp-status = 'ok'.
-    APPEND |Read { lines( lt_p ) } ABAP kernel parameters via C_SAPGPARAM| TO rs_resp-messages.
+    APPEND |Read { lines( lt_p ) } ABAP memory parameters + live usage| TO rs_resp-messages.
     /ui2/cl_json=>serialize(
       EXPORTING data        = lt_p
                 pretty_name = /ui2/cl_json=>pretty_mode-none
