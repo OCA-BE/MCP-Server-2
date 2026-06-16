@@ -1,7 +1,7 @@
 # abap-config-mcp
 
 > A standalone [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server for SAP ABAP development **and customizing**.
-> Connects directly to your SAP system via the ADT REST API and exposes **54 tools** to any MCP-compatible AI client — **no VS Code, no Copilot subscription required**.
+> Connects directly to your SAP system via the ADT REST API and exposes **58 tools** to any MCP-compatible AI client — **no VS Code, no Copilot subscription required**.
 
 It does two things that, together, let an AI assistant work in an SAP system the way a developer/consultant does:
 
@@ -144,7 +144,7 @@ You should see the startup banner (your version numbers may be newer):
 ║                 ABAP Config MCP Server v1.9.0                        ║
 ╠══════════════════════════════════════════════════════════════════════╣
 ║  Server version    : 1.9.0                                           ║
-║  Cust. engine ver. : 0.9.11  (expected on SAP after deploy)         ║
+║  Cust. engine ver. : 0.9.17  (expected on SAP after deploy)         ║
 ╠══════════════════════════════════════════════════════════════════════╣
 ║  MCP endpoint  : http://localhost:4847/mcp                          ║
 ║  Health check  : http://localhost:4847/health                      ║
@@ -303,6 +303,42 @@ customizing is the point. It is **not** meant to perform development or customiz
 > you do the job, and let SAP enforce it. On Production, that authorization is
 > read-only.
 
+### 4. Risk tiers — cap the tool surface with `ABAP_MCP_MAX_TIER`
+
+SAP authorizations are the *real* control, but the server can also hide whole classes of
+tool so a deployment exposes only what corporate security accepts. All 58 tools are
+classified into three risk tiers (full registry: **[docs/TIERS.md](docs/TIERS.md)**):
+
+| Tier | What it does | Examples |
+|---|---|---|
+| **0** | read-only / diagnostics | `execute_data_query`, `customizing_read`, `hana_memory_report`, `abap_memory_report`, `where_used`, `analyze_dump` |
+| **1** | config / data writes (SM30 runtime, governed transports) | `customizing_apply`, `customizing_create`, `org_copy`, `retail_listing` |
+| **2** | repository / code writes, execution, debug | `write_abap_object_source`, `abap_activate`, `run_unit_tests`, `engine_deploy`, `abap_debug_*` |
+
+Set **`ABAP_MCP_MAX_TIER`** = `0` (read-only Production server), `1` (also allow
+governed customizing), or `2`/unset (full Dev surface). Tools above the ceiling are
+**not registered at all**, and any *unclassified* tool defaults to Tier 2 — a new tool
+is never silently exposed on a restricted server.
+
+### 5. In-system ABAP: transported, not pushed (`engine_deploy`)
+
+The server installs a small amount of ABAP into the box (the customizing/diagnostic
+engine). For Production these objects should arrive via **normal CTS transport**, not the
+Tier-2 bootstrap push. They're split into two units so the low-risk part can ship and be
+approved on its own:
+
+| Unit | In-system object | Tier | Prod path |
+|---|---|---|---|
+| `diag` | `ZCL_MCP_DIAG` (+ SICF `/sap/bc/zmcp_diag`) — ping/env probe, HANA + ABAP memory, read-only | 0 | ✅ ship via CTS — standalone box-health value |
+| `cust` | `ZCL_MCP_CUST_ENGINE` + `ZMCP_CUST_WRITE` — customizing writes, org copy, listing | 1 | with scrutiny |
+
+The **`engine_deploy`** tool makes transportability a per-connection *choice*: run it per
+unit with `transportable:true package:"ZMCP_DIAG" transport:"…"` to create it in a
+Workbench Z package on a transport (CTS to Prod), or `transportable:false` for `$TMP`
+(Dev-only); re-run any time to flip a unit. The unit's **SICF node is registered
+automatically** as part of the deploy. See **[docs/TIERS.md](docs/TIERS.md)** for the
+full deployment + capability-awareness story.
+
 ---
 
 ## Connecting AI clients
@@ -421,7 +457,7 @@ M365 Copilot connects to MCP servers through **Copilot Studio**, which then surf
    | Authentication | **API Key** |
    | API Key | your `server.apiKey` value from `connections.json` |
 
-5. Copilot Studio auto-discovers all 54 tools via the MCP handshake — no manual tool registration needed
+5. Copilot Studio auto-discovers all 58 tools via the MCP handshake — no manual tool registration needed
 
 6. **Publish** the agent and deploy it to Microsoft 365
 
@@ -459,7 +495,7 @@ IBM Bob is IBM's AI coding IDE (1.0 released March 2026). It has native MCP supp
 
 > If Bob and the SAP system are on the same network (e.g. both inside your corporate VPN), use the plain `http://` URL directly — no need to expose the server externally.
 
-Once configured, Bob's chat and agent modes can call all 54 tools directly: search objects, read/write source, manage transports, browse packages, query tables, and more.
+Once configured, Bob's chat and agent modes can call all 58 tools directly: search objects, read/write source, manage transports, browse packages, query tables, and more.
 
 ---
 
@@ -469,7 +505,7 @@ The project has two independent test suites.
 
 ### Unit tests — no SAP required
 
-172 tests covering all 54 tools. Each handler is tested in isolation with a mocked `ADTClient` — no SAP system, no network, runs in under 3 seconds. This is the default `npm test`.
+201 tests covering all 58 tools. Each handler is tested in isolation with a mocked `ADTClient` — no SAP system, no network, runs in under 3 seconds. This is the default `npm test`.
 
 ```bash
 npm test              # run once
@@ -523,7 +559,7 @@ Replace `CAR` with the `id` of any connection in your `connections.json`.
 
 ---
 
-## All 54 tools — detailed reference
+## All 58 tools — detailed reference
 
 ### Discovery
 
