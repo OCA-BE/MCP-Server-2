@@ -58,3 +58,25 @@ approved on its own:
 Build with a transportable Z package + Workbench request (the bootstrap tool
 accepts `packageName` + `transport`) so the diagnostic engine flows Dev→Prod
 through CTS, governed by corporate transport approval — independent of the MCP.
+
+### Transportability is a choice — `engine_deploy`
+Which in-system units are transportable is **per-connection config** (not a fixed
+tier rule), managed by the **`engine_deploy`** tool:
+- Run with **no unit** → first-run setup prompt (or current status) listing the
+  units (`diag` Tier 0, `cust` Tier 1) and how to deploy each.
+- `engine_deploy unit:"diag" transportable:true package:"ZMCP_DIAG" transport:"<req>"`
+  → creates the unit in a Workbench Z package on a transport (CTS to Prod).
+- `engine_deploy unit:"cust" transportable:false` → deploys to `$TMP` (Dev-only).
+- **Flip later**: re-run for any unit (including a higher-tier one) to promote it
+  to transportable with a new package/transport.
+
+Config persists in `engine-deploy.json` (git-ignored — it holds env-specific
+package/transport). After a transportable deploy, register the unit's SICF node
+once (the tool reports which).
+
+### Connected-target awareness (no failed calls)
+`capabilities.ts` derives a per-connection snapshot from the engine's ping/env
+probe (engine deployed? version, isS4, ECOP/CTS/LTMC) and caches it. Tools
+pre-flight against it (`requireCaps`) and refuse cleanly — e.g. `org_copy` says
+"not available" on a box without the ECOP entity copier (CAR) instead of calling
+the engine and failing.

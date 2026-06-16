@@ -13,6 +13,7 @@ import { registerPackageTools } from "./packages"
 import { registerTableDiscoveryTools } from "./tablediscovery"
 import { registerCustomizingTools } from "./customizing"
 import { registerCustomizingEngineTools } from "./customizingEngine"
+import { registerEngineDeployTools } from "./engineDeploy"
 import { wrapServerWithSessionRecovery } from "./sessionRecovery"
 import { wrapServerWithTierGating, getMaxTier } from "./riskTiers"
 import { log } from "../connections"
@@ -45,4 +46,5 @@ export function registerAllTools(server: McpServer): void {
   registerTableDiscoveryTools(target)
   registerCustomizingTools(target)
   registerCustomizingEngineTools(target)
+  registerEngineDeployTools(target)
 }
