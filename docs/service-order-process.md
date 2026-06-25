@@ -1,12 +1,149 @@
-# SAP CS/PM Service Order Process — Configuration Guide
+# SAP Service Order Process — Configuration Guide
 
-Customizing reference for the **Plant Maintenance (PM) / Customer Service (CS)** service-order
-process on an S/4HANA system, driven headlessly via the **abap-config-mcp** in-system engine.
-Follows the same table-grounded, IMG-linked style as the retail and POS-DTA config guides.
+Customizing reference for service-order processes on S/4HANA, covering **both** the
+recommended greenfield path and the legacy brownfield path. Driven headlessly via the
+**abap-config-mcp** in-system engine. Follows the same table-grounded, IMG-linked style
+as the retail and POS-DTA config guides.
 
 ---
 
-## What a service order is
+## ⚠️ Greenfield recommendation: use S/4HANA Service Management, not classic CS
+
+> **For any greenfield S/4HANA implementation SAP's official recommendation is to use
+> S/4HANA Service Management** (module `S4SM`, formerly "Advanced Service Management" /
+> "CRM-based Service") **instead of the classic Customer Service (CS) component.**
+
+Classic CS (`IW31`/`IW32`, PM order type `SM*`) is still shipped and supported, but SAP
+positions it as **legacy** for customer-facing service processes. The CRM-based engine is
+the strategic product and receives all new feature investment (Field Service & Dispatch
+Management, Subscription Billing, Outcome-Based Service, S/4HANA Cloud parity).
+
+### When to use which
+
+| Scenario | Recommended path |
+|---|---|
+| **Greenfield** — new S/4HANA system, customer-facing service | **S/4HANA Service Management** (CRM-based, `S4SM`) |
+| **Greenfield** — internal plant maintenance only, no customer billing | Classic PM (`PM01`/`PM02`) — still the standard path for pure maintenance |
+| **Brownfield / system conversion** from ECC with existing CS customizing | Classic CS can be retained; migration to S4SM is a separate project |
+| **Two-tier** (S/4HANA Cloud Public Edition) | S/4HANA Service is the only option (classic CS is not available in PCE) |
+
+---
+
+## Part A — S/4HANA Service Management (CRM-based, greenfield path)
+
+### What it is
+
+S/4HANA Service Management is built on the S/4HANA embedded CRM foundation
+(`CRM_S4`, formerly "SAP CRM on S/4HANA"). Its core objects are:
+
+| Object | Transaction / app | Description |
+|---|---|---|
+| **Service Order** | `SMEN_UI_SRVO` / Fiori "Manage Service Orders" | The central work document (replaces CS order `IW31`) |
+| **Service Request** | Fiori "Manage Service Requests" | Inbound request / ticket (replaces PM notification) |
+| **Service Contract** | Fiori "Manage Service Contracts" | Periodic / value-based agreements |
+| **Installed Base** | Fiori "Manage Installed Bases" | Replaces PM functional location / equipment hierarchy |
+
+### Key organisational objects
+
+| Object | Table / domain | Meaning |
+|---|---|---|
+| **Service Organisation** | `CRMD_ORGMAN` / `HRP1000` (org unit) | The org unit that performs service (maps to a company code + plant) |
+| **Service Team** | `HRP1001` (org unit relationship) | Group within the service org |
+| **Business Partner** | `BUT000` / `KNA1` | Customer, sold-to, requester |
+| **Product (service)** | `MARA` (`MTART='DIEN'`) | Service product billed on the order |
+
+S/4HANA Service uses the **HR organisational model** (`PPOC_OLD`, OM-module) for its
+service organisation, not the classic PM planning-plant model.
+
+### Key customizing tables (S4SM)
+
+All are delivery class `C` and can be read / described / copied via the engine.
+
+| Table | IMG path | Content |
+|---|---|---|
+| `CRMC_PROC_TYPE` | Customer Management → Transactions → Define Transaction Types | **Transaction types** (service-order type, service-request type, contract type) — the S4SM equivalent of PM order types |
+| `CRMC_PROC_TYPET` | — | Transaction type texts |
+| `CRMC_ITEM_CAT` | … → Item Categories → Define Item Categories | Item categories (spare parts, labour, travel) |
+| `CRMC_ITEM_CAT_A` | … → Item Categories → Assign Item Categories | Item-category determination (transaction type + item type → item category) |
+| `CRMC_PARTNER_FCT` | … → Partner Processing → Define Partner Functions | Partner functions (sold-to, contact, service engineer) |
+| `CRMC_PARF_PROC` | … → Partner Processing → Define Partner Determination Procedure | Partner determination procedures |
+| `CRMC_STATUS_PRO` | … → Status Management → Define Status Profile | Status profiles (open, in process, completed, …) |
+| `CRMC_ORGMAN` | … → Organisational Management | Service organisation structure assignment |
+| `CRMC_BPGRP` | … → Business Partner → Define BP Groupings | BP groupings used for service partners |
+
+Inspect transaction types on the live system:
+
+```sql
+SELECT process_type, ddtext, process_mode
+  FROM crmc_proc_type
+ ORDER BY process_type
+```
+
+Describe the maintenance object for a transaction-type table:
+
+```
+customizing_describe table: "CRMC_PROC_TYPE"
+```
+
+Copy a delivered transaction type into a custom Z-type:
+
+```
+customizing_apply
+  table: "CRMC_PROC_TYPE"
+  action: "copy"
+  sourceKey: "SRVP"
+  targetKey: "ZSRV"
+  transport: "DEVK900NNN"
+  commit: true
+```
+
+> **Note:** `SRVP` is the standard S/4HANA Service service-order transaction type.
+> Verify the delivered key on your box with `customizing_read table: "CRMC_PROC_TYPE"`.
+
+### Item categories — the service product link
+
+In S4SM, an **item category** (not a PM work-centre activity) drives how a line is
+costed and billed. Key item-category types for service:
+
+| Item category | Meaning |
+|---|---|
+| `SRVO` | Service (labour / activity) |
+| `SRVP` | Spare part / product |
+| `SRVT` | Travel |
+
+The item-category determination (`CRMC_ITEM_CAT_A`) maps:
+`transaction type` + `item object type` → `item category`.
+
+### SLA / response times
+
+Response profile tables (class `C`, engine-writable):
+
+| Table | Content |
+|---|---|
+| `CRMC_SLA_PROF` | Response profile header |
+| `CRMC_SLA_PROF_T` | Response profile texts |
+| `CRMC_SERV_PROF` | Service profile (calendar + response profile) |
+
+### Settlement and billing
+
+S/4HANA Service uses **Revenue Accounting and Reporting (RAR)** or **SD billing**
+depending on the contract type:
+
+- **Time & Material orders**: items are billed directly via SD (billing request → SD billing
+  document); the `CRMC_PROC_TYPE.BILLING_TYPE` field controls which SD billing type is used.
+- **Fixed-price / periodic contracts**: billing plan on the service contract; same
+  `TFPLA` / `TFPLP` tables as classic SD.
+- **Outcome-based / subscription**: requires RAR (module `FARR`).
+
+---
+
+## Part B — Classic CS/PM (legacy / brownfield path)
+
+> Use this path only when **retaining existing ECC/CS customizing** in a system
+> conversion, or for **pure internal plant maintenance** (no customer billing).
+> For greenfield customer-facing service, use Part A above.
+
+### What a classic service order is
 
 A **PM/CS service order** (`AUFK`, `AFKO`) is an internal or customer-facing work order that:
 
@@ -19,7 +156,7 @@ is created, which catalogs apply, and so on. Most customizing is therefore per *
 
 ---
 
-## Configuration sequence (dependency order)
+### Configuration sequence (dependency order) — classic CS/PM
 
 | # | Step | Object / table | IMG path |
 |---|---|---|---|
@@ -35,9 +172,9 @@ is created, which catalogs apply, and so on. Most customizing is therefore per *
 
 ---
 
-## Step-by-step details
+### Step-by-step details
 
-### 1. Maintenance planning plant
+#### 1. Maintenance planning plant
 
 Every service order is assigned to a **planning plant** — the organisational unit that maintains
 the technical objects and work centres.
@@ -53,7 +190,7 @@ SELECT werks, name1, vkorg
 Headless via engine: storage locations and plant-level parameters are set through
 `customizing_create` / `customizing_apply` against `T001W`, `T001K`, and `T399A`.
 
-### 2. Order types (`T003O`)
+#### 2. Order types (`T003O`)
 
 Order types are the primary configuration gate. Delivered examples:
 
@@ -97,7 +234,7 @@ customizing_apply
   commit: true
 ```
 
-### 3. Settlement parameters (`TOCS`)
+#### 3. Settlement parameters (`TOCS`)
 
 Settlement parameters define how order costs are settled (percentage vs. equivalence numbers,
 allowed cost-object categories). One record per order-type / plant combination.
@@ -107,7 +244,7 @@ Key table: `TOCS` — fields `AUART` + `WERKS` (key), `ABKRS` (settlement profil
 > The settlement profile itself lives in CO customizing (`T811A`); the `TOCS` record just
 > assigns a profile to the order-type/plant combination.
 
-### 4. Notification types
+#### 4. Notification types
 
 A **PM/CS notification** (`QMEL`) precedes or accompanies a service order. Notification types
 group the breakdown/malfunction/service-request variants. Customizing lives in a mix of tables:
@@ -127,7 +264,7 @@ SELECT qmart, kurztext, qmkat
  ORDER BY qmart
 ```
 
-### 5. Catalogs, code groups and codes
+#### 5. Catalogs, code groups and codes
 
 PM/CS catalogs (`T370` / `T370A` / `T370C`) are the pick-lists for damage, cause, task, and
 activity codes on notifications and confirmations.
@@ -158,7 +295,7 @@ customizing_create
   commit: true
 ```
 
-### 6. Activity types and work centres
+#### 6. Activity types and work centres
 
 PM work centres (`T024W`, CAPP) are cross-client master data; activity types (`KA01` in CO)
 are client-dependent. The linkage:
@@ -168,7 +305,7 @@ are client-dependent. The linkage:
 
 Work-centre categories (cross-client config, not transported as customizing) are in `T006`.
 
-### 7. Partner functions
+#### 7. Partner functions
 
 Partner functions on service orders/notifications drive who is notified, who must approve, and
 who is billed. Configuration sits in:
@@ -183,7 +320,7 @@ who is billed. Configuration sits in:
 
 All are class `C` — transport-recorded via the engine.
 
-### 8. SD integration — service products and order types
+#### 8. SD integration — service products and order types
 
 When a CS service order is to be **billed to a customer**, it needs:
 
@@ -205,7 +342,7 @@ SELECT auart, bezei, autyp
 > article-validation rules as retail articles — use the Migration Cockpit
 > ("Migrate Your Data" → Product) for bulk loads; use `MM01`/`MM41` for one-off creation.
 
-### 9. Billing plan type (for service contracts)
+#### 9. Billing plan type (for service contracts)
 
 For periodic billing (maintenance contracts), a billing plan type is assigned to the SD item
 category. Key tables:
@@ -220,7 +357,17 @@ category. Key tables:
 
 ## Using the MCP tools
 
-### Discovery
+### Discovery — S/4HANA Service (Part A)
+
+```
+img_search keyword: "service order"               # S4SM IMG activities
+img_search keyword: "transaction type"
+customizing_describe table: "CRMC_PROC_TYPE"      # maintenance object, key fields, transport object
+customizing_read table: "CRMC_PROC_TYPE"          # all transaction types in the system
+customizing_read table: "CRMC_ITEM_CAT"           # item categories
+```
+
+### Discovery — classic CS/PM (Part B)
 
 ```
 img_search keyword: "service order"          # find IMG activities
@@ -256,6 +403,20 @@ customizing_create table: "T370A"
 
 ## Delivery-class reference for key tables
 
+### S/4HANA Service (Part A)
+
+| Table | Class | Headless path | Transport object |
+|---|---|---|---|
+| `CRMC_PROC_TYPE` | `C` | SM30 view `CRMC_PROC_TYPE` | `R3TR VDAT CRMC_PROC_TYPE` |
+| `CRMC_ITEM_CAT` | `C` | SM30 view `CRMC_ITEM_CAT` | `R3TR VDAT CRMC_ITEM_CAT` |
+| `CRMC_ITEM_CAT_A` | `C` | SM30 view `CRMC_ITEM_CAT_A` | `R3TR VDAT CRMC_ITEM_CAT_A` |
+| `CRMC_PARTNER_FCT` | `C` | SM30 view `CRMC_PARTNER_FCT` | `R3TR VDAT CRMC_PARTNER_FCT` |
+| `CRMC_PARF_PROC` | `C` | SM30 view `CRMC_PARF_PROC` | `R3TR VDAT CRMC_PARF_PROC` |
+| `CRMC_STATUS_PRO` | `C` | SM30 view `CRMC_STATUS_PRO` | `R3TR VDAT CRMC_STATUS_PRO` |
+| `CRMC_SLA_PROF` | `C` | SM30 view `CRMC_SLA_PROF` | `R3TR VDAT CRMC_SLA_PROF` |
+
+### Classic CS/PM (Part B)
+
 | Table | Class | Headless path | Transport object |
 |---|---|---|---|
 | `T003O` | `C` | `VIEW_MAINTENANCE_SINGLE_ENTRY` via `V_T003O` | `R3TR VDAT V_T003O` |
@@ -275,6 +436,16 @@ customizing_create table: "T370A"
 
 ## Open items / known limits
 
+### S/4HANA Service (Part A)
+- **HR org-model creation** (service organisation, service team) is managed through `PPOC_OLD`
+  (Org. Management) — master data, not customizing; not yet covered by a headless engine path.
+- **Business Partner creation** for service customers: use `BAPI_BUPA_CREATE_FROM_DATA`
+  in a background-job pattern (same approach as the retail site-BP creation).
+- **Fiori service activation** (OData services, IAM roles for the "Manage Service Orders" app):
+  requires `STC01` task list or `/IWFND/V4_ADMIN` — GUI-only, not an engine write.
+- **RAR / subscription billing** configuration is outside the customizing-engine scope.
+
+### Classic CS/PM (Part B)
 - **Number ranges for PM orders** (`INRO` object `PM_AUFNR`): maintained via SNRO/`NUMBER_RANGE_*`
   FMs; not supported by the current engine (NROB path is out of scope — see
   [pos-dta-customizing-schema.md](pos-dta-customizing-schema.md)).
