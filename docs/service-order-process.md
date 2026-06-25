@@ -206,7 +206,7 @@ Key fields in `T003O`:
 | Field | Meaning |
 |---|---|
 | `AUART` | Order type (key) |
-| `AUTYP` | Order category (`05`=PM, `06`=CS in older releases; blanks differ by version) |
+| `AUTYP` | Order category (`05`=PM, `06`=CS — verify on your release with `customizing_read table: "T003O"`) |
 | `ILEVL` | Initial priority |
 | `KALSM` | Costing sheet |
 | `PABKR` | Settlement profile |
@@ -303,7 +303,7 @@ are client-dependent. The linkage:
 - `CRHD` (work centre header) → `CRCO` (cost centre assignment) → CO activity type.
 - Activity type unit governs how labour confirmations are posted.
 
-Work-centre categories (cross-client config, not transported as customizing) are in `T006`.
+Work-centre categories (cross-client config, not transported as customizing) are in `TC24`.
 
 #### 7. Partner functions
 
